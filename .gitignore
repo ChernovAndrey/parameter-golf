@@ -1,6 +1,7 @@
 data/tokenizers
 __pycache__/
 .DS_Store
+.idea/
 modded-nanogpt/
 modded-nanogpt
 data/datasets
