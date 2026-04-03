@@ -1339,17 +1339,27 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int,
                 out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
             consumed.add(name)
         elif name == "mlp_shared_up" and layer_to_group:
-            a_up_A, a_up_B = sd["adapter_up_A"], sd["adapter_up_B"]
+            has_adapters = "adapter_up_A" in sd
+            if has_adapters:
+                a_up_A, a_up_B = sd["adapter_up_A"], sd["adapter_up_B"]
             for i in range(n):
                 g = layer_to_group[i]
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[g] + a_up_A[i] @ a_up_B[i]
-            consumed.update({"mlp_shared_up", "adapter_up_A", "adapter_up_B"})
+                eff = tensor[g] + a_up_A[i] @ a_up_B[i] if has_adapters else tensor[g]
+                out[f"blocks.{i}.mlp.fc.weight"] = eff
+            consumed.add("mlp_shared_up")
+            if has_adapters:
+                consumed.update({"adapter_up_A", "adapter_up_B"})
         elif name == "mlp_shared_down" and layer_to_group:
-            a_dn_A, a_dn_B = sd["adapter_down_A"], sd["adapter_down_B"]
+            has_adapters = "adapter_down_A" in sd
+            if has_adapters:
+                a_dn_A, a_dn_B = sd["adapter_down_A"], sd["adapter_down_B"]
             for i in range(n):
                 g = layer_to_group[i]
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[g] + a_dn_A[i] @ a_dn_B[i]
-            consumed.update({"mlp_shared_down", "adapter_down_A", "adapter_down_B"})
+                eff = tensor[g] + a_dn_A[i] @ a_dn_B[i] if has_adapters else tensor[g]
+                out[f"blocks.{i}.mlp.proj.weight"] = eff
+            consumed.add("mlp_shared_down")
+            if has_adapters:
+                consumed.update({"adapter_down_A", "adapter_down_B"})
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1378,12 +1388,13 @@ def _unbank_for_quantization(sd: dict[str, Tensor], num_layers: int,
             out[f"shared_mlp.{g}.up"] = sd["mlp_shared_up"][g]
             out[f"shared_mlp.{g}.down"] = sd["mlp_shared_down"][g]
         consumed.update({"mlp_shared_up", "mlp_shared_down"})
-        for i in range(n):
-            out[f"blocks.{i}.adapter.up_A"] = sd["adapter_up_A"][i]
-            out[f"blocks.{i}.adapter.up_B"] = sd["adapter_up_B"][i]
-            out[f"blocks.{i}.adapter.down_A"] = sd["adapter_down_A"][i]
-            out[f"blocks.{i}.adapter.down_B"] = sd["adapter_down_B"][i]
-        consumed.update({"adapter_up_A", "adapter_up_B", "adapter_down_A", "adapter_down_B"})
+        if "adapter_up_A" in sd:
+            for i in range(n):
+                out[f"blocks.{i}.adapter.up_A"] = sd["adapter_up_A"][i]
+                out[f"blocks.{i}.adapter.up_B"] = sd["adapter_up_B"][i]
+                out[f"blocks.{i}.adapter.down_A"] = sd["adapter_down_A"][i]
+                out[f"blocks.{i}.adapter.down_B"] = sd["adapter_down_B"][i]
+            consumed.update({"adapter_up_A", "adapter_up_B", "adapter_down_A", "adapter_down_B"})
     elif "mlp_up_bank" in sd:
         for i in range(n):
             out[f"blocks.{i}.mlp.fc.weight"] = sd["mlp_up_bank"][i]
