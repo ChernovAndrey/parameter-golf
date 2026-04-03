@@ -33,9 +33,14 @@ Step     SOTA      Ours      Gap       Notes
 2500     2.1464    2.2099    +0.064    Both fluctuating
 3000     2.1423    2.1081    -0.034    We overtake! (our warmdown helping)
 3500     2.1495    2.0921    -0.057    Still ahead in warmdown
-4000     1.9433    2.0807    +0.137    SOTA at full LR, us in warmdown (unfair comparison)
-4000     val_bpb:  1.2051    1.2012    -0.004    Our val_bpb beats SOTA at same step count!
-4720     —         1.1720    —         Our final pre-quant
+4000     1.9433    2.0807    +0.137    SOTA at full LR, us in warmdown
+4000     val_bpb:  1.2051    1.2012    -0.004    Our val_bpb beats SOTA at same step!
+4500     2.0982    2.0797    -0.019    Still ahead
+4720     —         1.1720    —         Our final pre-quant (wallclock stop)
+5000     2.0805    —         —         SOTA continues training
+5500     1.9939    —         —         SOTA in warmdown
+6000     1.9209    —         —         SOTA SWA active
+6500     2.0612    —         —         SOTA QAT active
 6927     1.1354    —         —         SOTA final pre-quant
 ```
 
