@@ -840,19 +840,25 @@ class GPT(nn.Module):
         # Shared MLP bases + low-rank per-layer adapters
         self.adapter_rank = adapter_rank
         self.num_shared_mlps = num_shared_mlps
-        if num_shared_mlps > 0 and adapter_rank > 0:
+        if num_shared_mlps > 0:
             if layer_groups:
                 self.layer_to_group = [int(x) for x in layer_groups.split(",")]
             else:
                 self.layer_to_group = [min(i * num_shared_mlps // num_layers, num_shared_mlps - 1)
                                        for i in range(num_layers)]
-            r = adapter_rank
             self.mlp_shared_up = nn.Parameter(torch.empty(num_shared_mlps, mlp_dim, model_dim))
             self.mlp_shared_down = nn.Parameter(torch.empty(num_shared_mlps, model_dim, mlp_dim))
-            self.adapter_up_A = nn.Parameter(torch.empty(num_layers, mlp_dim, r))
-            self.adapter_up_B = nn.Parameter(torch.empty(num_layers, r, model_dim))
-            self.adapter_down_A = nn.Parameter(torch.empty(num_layers, model_dim, r))
-            self.adapter_down_B = nn.Parameter(torch.empty(num_layers, r, mlp_dim))
+            if adapter_rank > 0:
+                r = adapter_rank
+                self.adapter_up_A = nn.Parameter(torch.empty(num_layers, mlp_dim, r))
+                self.adapter_up_B = nn.Parameter(torch.empty(num_layers, r, model_dim))
+                self.adapter_down_A = nn.Parameter(torch.empty(num_layers, model_dim, r))
+                self.adapter_down_B = nn.Parameter(torch.empty(num_layers, r, mlp_dim))
+            else:
+                self.adapter_up_A = None
+                self.adapter_up_B = None
+                self.adapter_down_A = None
+                self.adapter_down_B = None
             self.mlp_up_bank = None
             self.mlp_down_bank = None
         else:
@@ -933,11 +939,12 @@ class GPT(nn.Module):
                 nn.init.orthogonal_(self.mlp_shared_up.data[g], gain=1.0)
                 nn.init.zeros_(self.mlp_shared_down.data[g])
                 self.mlp_shared_down.data[g].mul_(proj_scale)
-            # LoRA-style init: A random (so B gets gradients from step 1), B zeros (A@B=0 at init)
-            nn.init.kaiming_uniform_(self.adapter_up_A.data, a=math.sqrt(5))
-            nn.init.zeros_(self.adapter_up_B.data)
-            nn.init.kaiming_uniform_(self.adapter_down_A.data, a=math.sqrt(5))
-            nn.init.zeros_(self.adapter_down_B.data)
+            if self.adapter_up_A is not None:
+                # LoRA-style init: A random (so B gets gradients from step 1), B zeros (A@B=0 at init)
+                nn.init.kaiming_uniform_(self.adapter_up_A.data, a=math.sqrt(5))
+                nn.init.zeros_(self.adapter_up_B.data)
+                nn.init.kaiming_uniform_(self.adapter_down_A.data, a=math.sqrt(5))
+                nn.init.zeros_(self.adapter_down_B.data)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -946,12 +953,14 @@ class GPT(nn.Module):
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
     def _effective_mlp_weights(self, i: int) -> tuple[Tensor, Tensor]:
-        """Compute effective MLP weights: shared base + low-rank adapter."""
+        """Compute effective MLP weights: shared base + optional low-rank adapter."""
         if self.mlp_shared_up is not None:
             g = self.layer_to_group[i]
-            up_eff = self.mlp_shared_up[g] + self.adapter_up_A[i] @ self.adapter_up_B[i]
-            down_eff = self.mlp_shared_down[g] + self.adapter_down_A[i] @ self.adapter_down_B[i]
-            return up_eff, down_eff
+            if self.adapter_up_A is not None:
+                up_eff = self.mlp_shared_up[g] + self.adapter_up_A[i] @ self.adapter_up_B[i]
+                down_eff = self.mlp_shared_down[g] + self.adapter_down_A[i] @ self.adapter_down_B[i]
+                return up_eff, down_eff
+            return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
@@ -1805,10 +1814,11 @@ def main() -> None:
     if base_model.mlp_shared_up is not None:
         base_model.mlp_shared_up.data = base_model.mlp_shared_up.data.float()
         base_model.mlp_shared_down.data = base_model.mlp_shared_down.data.float()
-        base_model.adapter_up_A.data = base_model.adapter_up_A.data.float()
-        base_model.adapter_up_B.data = base_model.adapter_up_B.data.float()
-        base_model.adapter_down_A.data = base_model.adapter_down_A.data.float()
-        base_model.adapter_down_B.data = base_model.adapter_down_B.data.float()
+        if base_model.adapter_up_A is not None:
+            base_model.adapter_up_A.data = base_model.adapter_up_A.data.float()
+            base_model.adapter_up_B.data = base_model.adapter_up_B.data.float()
+            base_model.adapter_down_A.data = base_model.adapter_down_A.data.float()
+            base_model.adapter_down_B.data = base_model.adapter_down_B.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1827,11 +1837,12 @@ def main() -> None:
     if base_model.mlp_up_bank is not None:
         matrix_params += [base_model.mlp_up_bank, base_model.mlp_down_bank]
     if base_model.mlp_shared_up is not None:
-        matrix_params += [
-            base_model.mlp_shared_up, base_model.mlp_shared_down,
-            base_model.adapter_up_A, base_model.adapter_up_B,
-            base_model.adapter_down_A, base_model.adapter_down_B,
-        ]
+        matrix_params += [base_model.mlp_shared_up, base_model.mlp_shared_down]
+        if base_model.adapter_up_A is not None:
+            matrix_params += [
+                base_model.adapter_up_A, base_model.adapter_up_B,
+                base_model.adapter_down_A, base_model.adapter_down_B,
+            ]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
