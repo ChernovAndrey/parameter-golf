@@ -1446,21 +1446,26 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int,
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
     if has_shared and layer_to_group:
+        has_adapters = any(k.startswith("blocks.") and ".adapter." in k for k in sd)
         for i in range(n):
             g = layer_to_group[i]
             su = sd[f"shared_mlp.{g}.up"]
             sdn = sd[f"shared_mlp.{g}.down"]
-            a_uA = sd[f"blocks.{i}.adapter.up_A"]
-            a_uB = sd[f"blocks.{i}.adapter.up_B"]
-            a_dA = sd[f"blocks.{i}.adapter.down_A"]
-            a_dB = sd[f"blocks.{i}.adapter.down_B"]
-            up_slices[i] = su + a_uA @ a_uB
-            down_slices[i] = sdn + a_dA @ a_dB
-            consumed.update({
-                f"shared_mlp.{g}.up", f"shared_mlp.{g}.down",
-                f"blocks.{i}.adapter.up_A", f"blocks.{i}.adapter.up_B",
-                f"blocks.{i}.adapter.down_A", f"blocks.{i}.adapter.down_B",
-            })
+            if has_adapters:
+                a_uA = sd[f"blocks.{i}.adapter.up_A"]
+                a_uB = sd[f"blocks.{i}.adapter.up_B"]
+                a_dA = sd[f"blocks.{i}.adapter.down_A"]
+                a_dB = sd[f"blocks.{i}.adapter.down_B"]
+                up_slices[i] = su + a_uA @ a_uB
+                down_slices[i] = sdn + a_dA @ a_dB
+                consumed.update({
+                    f"blocks.{i}.adapter.up_A", f"blocks.{i}.adapter.up_B",
+                    f"blocks.{i}.adapter.down_A", f"blocks.{i}.adapter.down_B",
+                })
+            else:
+                up_slices[i] = su
+                down_slices[i] = sdn
+            consumed.update({f"shared_mlp.{g}.up", f"shared_mlp.{g}.down"})
     else:
         for i in range(n):
             fk = f"blocks.{i}.mlp.fc.weight"
