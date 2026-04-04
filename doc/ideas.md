@@ -96,6 +96,42 @@ Almost no step time impact. Might capture the most important per-layer differenc
 
 ---
 
+### 7. Shared MLP + rank-25 lossless adapters (5x MLP, 5 bases, GQA-4)
+
+The "sweet spot" rank where ALL adapter matrices stay under 65K elements
+→ fp16 passthrough → zero quantization error on adapters.
+
+Max lossless rank = floor(65536 / mlp_dim):
+- 5x MLP (2560): max rank 25
+- 4x MLP (2048): max rank 32
+- 3x MLP (1536): max rank 42
+
+```bash
+export NUM_LAYERS=11 NUM_KV_HEADS=4 MLP_MULT=5 ADAPTER_RANK=25 NUM_SHARED_MLPS=5
+```
+
+| Metric | Value |
+|--------|-------|
+| MLP hidden | 2560 (5x) |
+| Adapter rank | 25 (all fp16, zero quant error) |
+| Bases | 5 (sharing: [3,2,2,2,2]) |
+| Artifact | ~15.2M (830 KB headroom) |
+| Steps | ~5,600 |
+
+**Why**: Gets per-layer specialization AND zero adapter quantization error
+AND 5x MLP width. Best of all worlds if the rank-25 perturbation is enough.
+
+### 8. Layer conditioning via hidden bias/gate (add to any shared config)
+
+Encode layer identity into the shared MLP computation. Negligible cost (~28K params).
+
+Hidden bias: shifts pre-activation per layer → different neurons activate
+Hidden gate: scales activations per layer → soft neuron selection
+
+Can be added on top of any shared MLP config for free.
+
+---
+
 ## Ideas Not Yet Explored
 
 ### 7. Asymmetric sharing
@@ -118,7 +154,20 @@ context per position. But embedding cost grows.
 Factored embedding (like ternary submission): 8192 vocab × 256 bottleneck
 + projection. Fits in similar budget.
 
-### 10. Shared attention too (risky)
+### 11. Pure low-rank MLP (no shared base, just A@B)
+
+VERDICT: Probably doesn't work. Without a shared base, each layer's MLP
+is rank-R only. At rank 25, that's 25 independent features out of 512 —
+20x weaker than SOTA's full-rank MLP. The shared base provides the
+full-rank foundation; small adapters just tweak it. Removing the base
+forces adapters to do everything → needs rank 200+ → large matrices →
+int6 quantized → loses the lossless advantage.
+
+Budget would be tiny (~2M artifact for all MLPs) but quality would be
+catastrophically bad. Only viable at very high rank, at which point
+it's just independent MLPs with extra steps.
+
+### 12. Shared attention too (risky)
 Share K,V projections between adjacent layers (not Q,O).
 This is closer to PR #363 territory but less aggressive — only K,V shared,
 Q,O independent. Each layer still computes unique attention patterns.
