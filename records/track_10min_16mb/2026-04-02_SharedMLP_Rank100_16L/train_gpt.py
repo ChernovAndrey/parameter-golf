@@ -996,15 +996,16 @@ class GPT(nn.Module):
         x_flat = x.reshape(BT, D)
         # Router scores: [BT, K]
         scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
-        # Gate values: softmax across EXPERTS per token (not across tokens)
-        gates = F.softmax(scores, dim=-1)  # [BT, K]
+        # Gate values: softmax in float32 for numerical precision
+        gates = F.softmax(scores.float(), dim=-1).to(scores.dtype)  # [BT, K]
         # Expert choice: each expert picks its top tokens based on raw scores
         expert_scores = scores.T  # [K, BT]
         _, top_idxs = expert_scores.topk(tpe, dim=-1)  # [K, tpe]
         # Gather gate values for selected tokens
         selected_gates = gates.T.gather(1, top_idxs)  # [K, tpe]
-        # Gather tokens per expert
-        x_sel = x_flat[top_idxs]  # [K, tpe, D]
+        # Gather tokens per expert (explicit gather, more compile-friendly than fancy indexing)
+        x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
+                             top_idxs.unsqueeze(-1).expand(-1, -1, D))  # [K, tpe, D]
         # Batched MLP forward
         pool_up = self.mlp_shared_up.to(x_sel.dtype)
         pool_down = self.mlp_shared_down.to(x_sel.dtype)
