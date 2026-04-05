@@ -132,6 +132,28 @@ Can be added on top of any shared MLP config for free.
 
 ---
 
+### 9. Focal Loss for Hard Token Focus
+
+Reweight loss so hard tokens contribute more gradient, easy tokens less:
+
+```python
+p = softmax(logits)[target]
+weight = (1 - p) ** gamma       # gamma=1: linear, gamma=2: aggressive
+loss = (weight * cross_entropy).mean()
+```
+
+Zero compute overhead, zero params, one-line change. The model focuses
+training on tokens it's struggling with instead of wasting gradient on
+tokens it already predicts well.
+
+Risk: BPB counts all tokens equally. If easy tokens degrade more than
+hard tokens improve, net BPB worsens. Best with gamma=0.5-1.0 (mild).
+
+Also consider: loss truncation (drop easiest 20-30% of tokens from loss)
+or self-weighted loss (weight = loss^0.5).
+
+---
+
 ## Ideas Not Yet Explored
 
 ### 7. Asymmetric sharing

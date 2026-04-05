@@ -99,6 +99,7 @@ class Hyperparameters:
     num_shared_mlps = int(os.environ.get("NUM_SHARED_MLPS", 3))
     layer_groups = os.environ.get("LAYER_GROUPS", "")
     mlp_layer_bias = bool(int(os.environ.get("MLP_LAYER_BIAS", "0")))
+    mlp_pool_routing = bool(int(os.environ.get("MLP_POOL_ROUTING", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -775,6 +776,13 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
+    def forward_attn_only(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None, Tensor]:
+        """Run attention only, return post-attention state for external MLP routing."""
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        return x_out, raw_v, x_in
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None, mlp_hidden_bias: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -817,6 +825,7 @@ class GPT(nn.Module):
         num_shared_mlps: int = 0,
         layer_groups: str = "",
         mlp_layer_bias: bool = False,
+        mlp_pool_routing: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -881,6 +890,12 @@ class GPT(nn.Module):
             self.mlp_hidden_bias = nn.Parameter(torch.zeros(num_layers, mlp_dim))
         else:
             self.mlp_hidden_bias = None
+        # Pool routing: per-layer router for expert choice MLP selection
+        self.mlp_pool_routing = mlp_pool_routing
+        if mlp_pool_routing and num_shared_mlps > 0:
+            self.mlp_routers = nn.Parameter(torch.randn(num_layers, model_dim, num_shared_mlps) * 0.01)
+        else:
+            self.mlp_routers = None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -972,6 +987,51 @@ class GPT(nn.Module):
                 return up_eff, down_eff
             return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
+    def _pool_routed_mlp_forward(self, x: Tensor, layer_idx: int) -> Tensor:
+        """Expert choice routing: each pool MLP picks its top tokens, processed via bmm."""
+        B, T, D = x.shape
+        BT = B * T
+        K = self.num_shared_mlps
+        tpe = BT // K
+        x_flat = x.reshape(BT, D)
+        # Router scores: [BT, K]
+        scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
+        # Gate values: softmax across EXPERTS per token (not across tokens)
+        gates = F.softmax(scores, dim=-1)  # [BT, K]
+        # Expert choice: each expert picks its top tokens based on raw scores
+        expert_scores = scores.T  # [K, BT]
+        _, top_idxs = expert_scores.topk(tpe, dim=-1)  # [K, tpe]
+        # Gather gate values for selected tokens
+        selected_gates = gates.T.gather(1, top_idxs)  # [K, tpe]
+        # Gather tokens per expert
+        x_sel = x_flat[top_idxs]  # [K, tpe, D]
+        # Batched MLP forward
+        pool_up = self.mlp_shared_up.to(x_sel.dtype)
+        pool_down = self.mlp_shared_down.to(x_sel.dtype)
+        h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
+        if self.mlp_hidden_bias is not None:
+            h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
+        h = F.leaky_relu(h, negative_slope=0.5).square()
+        y = torch.bmm(h, pool_down.transpose(-1, -2))
+        # Weight by per-token gate value (softmax across experts)
+        y = y * selected_gates.unsqueeze(-1)
+        # Scatter back
+        output = torch.zeros(BT, D, device=x.device, dtype=y.dtype)
+        flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
+        output.scatter_add_(0, flat_idxs, y.reshape(-1, D))
+        # Renormalize: each token's total gate weight → 1.0
+        gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y.dtype)
+        gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
+        gate_sums = gate_sums.clamp(min=1e-6)
+        output = output / gate_sums
+        # Track routing stats for diagnostics (layer 0 only)
+        # Store raw tensor for logging outside compiled graph (avoid .item() graph break)
+        if layer_idx == 0 and self.training:
+            pick_counts = torch.zeros(BT, device=x.device, dtype=torch.int32)
+            pick_counts.scatter_add_(0, top_idxs.reshape(-1),
+                                     torch.ones(K * tpe, device=x.device, dtype=torch.int32))
+            self._routing_pick_counts = pick_counts  # logged outside forward
+        return output.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -994,12 +1054,23 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            up_w, down_w = self._effective_mlp_weights(i)
-            hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], up_w, down_w,
-                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
+            if self.mlp_routers is not None:
+                x_attn, raw_v, x_in = self.blocks[i].forward_attn_only(
+                    x, x0, self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], v_embed=ve, v0=v0)
+                mlp_input = self.blocks[i].mlp_norm(x_attn) * self.blocks[i].ln_scale_factor
+                mlp_out = self._pool_routed_mlp_forward(mlp_input, i)
+                x = x_attn + self.blocks[i].mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * mlp_out
+                if self.blocks[i].dtg_gate is not None:
+                    gate = torch.sigmoid(self.blocks[i].dtg_gate(x_in.detach()))
+                    x = x_in + gate * (x - x_in)
+            else:
+                up_w, down_w = self._effective_mlp_weights(i)
+                hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], up_w, down_w,
+                    v_embed=ve, v0=v0, mlp_hidden_bias=hb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1008,12 +1079,23 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            up_w, down_w = self._effective_mlp_weights(bi)
-            hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], up_w, down_w,
-                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
+            if self.mlp_routers is not None:
+                x_attn, _, x_in = self.blocks[bi].forward_attn_only(
+                    x, x0, self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], v_embed=ve, v0=v0)
+                mlp_input = self.blocks[bi].mlp_norm(x_attn) * self.blocks[bi].ln_scale_factor
+                mlp_out = self._pool_routed_mlp_forward(mlp_input, bi)
+                x = x_attn + self.blocks[bi].mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * mlp_out
+                if self.blocks[bi].dtg_gate is not None:
+                    gate = torch.sigmoid(self.blocks[bi].dtg_gate(x_in.detach()))
+                    x = x_in + gate * (x - x_in)
+            else:
+                up_w, down_w = self._effective_mlp_weights(bi)
+                hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], up_w, down_w,
+                    v_embed=ve, v0=v0, mlp_hidden_bias=hb)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1056,12 +1138,23 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            up_w, down_w = self._effective_mlp_weights(i)
-            hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], up_w, down_w,
-                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
+            if self.mlp_routers is not None:
+                x_attn, raw_v, x_in = self.blocks[i].forward_attn_only(
+                    x, x0, self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], v_embed=ve, v0=v0)
+                mlp_input = self.blocks[i].mlp_norm(x_attn) * self.blocks[i].ln_scale_factor
+                mlp_out = self._pool_routed_mlp_forward(mlp_input, i)
+                x = x_attn + self.blocks[i].mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * mlp_out
+                if self.blocks[i].dtg_gate is not None:
+                    gate = torch.sigmoid(self.blocks[i].dtg_gate(x_in.detach()))
+                    x = x_in + gate * (x - x_in)
+            else:
+                up_w, down_w = self._effective_mlp_weights(i)
+                hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], up_w, down_w,
+                    v_embed=ve, v0=v0, mlp_hidden_bias=hb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1070,12 +1163,23 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            up_w, down_w = self._effective_mlp_weights(bi)
-            hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], up_w, down_w,
-                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
+            if self.mlp_routers is not None:
+                x_attn, _, x_in = self.blocks[bi].forward_attn_only(
+                    x, x0, self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], v_embed=ve, v0=v0)
+                mlp_input = self.blocks[bi].mlp_norm(x_attn) * self.blocks[bi].ln_scale_factor
+                mlp_out = self._pool_routed_mlp_forward(mlp_input, bi)
+                x = x_attn + self.blocks[bi].mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * mlp_out
+                if self.blocks[bi].dtg_gate is not None:
+                    gate = torch.sigmoid(self.blocks[bi].dtg_gate(x_in.detach()))
+                    x = x_in + gate * (x - x_in)
+            else:
+                up_w, down_w = self._effective_mlp_weights(bi)
+                hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], up_w, down_w,
+                    v_embed=ve, v0=v0, mlp_hidden_bias=hb)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1220,6 +1324,8 @@ def collect_hessians_from_tokens(hessian_model, token_seqs, device):
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    if "mlp_routers" in name:
+        return "other"
     if "shared_mlp" in name:
         return "mlp"
     if ".adapter." in name:
@@ -1459,7 +1565,19 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int,
         if vk in sd: kv_slices[n + i] = sd[vk]; consumed.add(vk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    if has_shared and layer_to_group:
+    template_has_shared = "mlp_shared_up" in template_sd
+    if has_shared and layer_to_group and template_has_shared:
+        # Routed eval: restack shared MLPs from per-group keys (no expansion to per-layer)
+        num_shared = max(layer_to_group) + 1
+        shared_up_list = [sd[f"shared_mlp.{g}.up"] for g in range(num_shared)]
+        shared_down_list = [sd[f"shared_mlp.{g}.down"] for g in range(num_shared)]
+        mlp_dtype = template_sd["mlp_shared_up"].dtype
+        out["mlp_shared_up"] = torch.stack(shared_up_list).to(dtype=mlp_dtype)
+        out["mlp_shared_down"] = torch.stack(shared_down_list).to(dtype=mlp_dtype)
+        for g in range(num_shared):
+            consumed.update({f"shared_mlp.{g}.up", f"shared_mlp.{g}.down"})
+    elif has_shared and layer_to_group:
+        # Non-routed eval: expand shared+adapter to per-layer mlp_up_bank/mlp_down_bank
         has_adapters = any(k.startswith("blocks.") and ".adapter." in k for k in sd)
         for i in range(n):
             g = layer_to_group[i]
@@ -1480,16 +1598,18 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int,
                 up_slices[i] = su
                 down_slices[i] = sdn
             consumed.update({f"shared_mlp.{g}.up", f"shared_mlp.{g}.down"})
+        mlp_dtype = template_sd.get("mlp_up_bank", next(iter(template_sd.values()))).dtype
+        out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=mlp_dtype)
+        out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=mlp_dtype)
     else:
         for i in range(n):
             fk = f"blocks.{i}.mlp.fc.weight"
             if fk in sd: up_slices[i] = sd[fk]; consumed.add(fk)
             dk = f"blocks.{i}.mlp.proj.weight"
             if dk in sd: down_slices[i] = sd[dk]; consumed.add(dk)
-    # Use mlp_up_bank dtype from template (eval model always has these)
-    mlp_dtype = template_sd.get("mlp_up_bank", template_sd.get("mlp_shared_up", next(iter(template_sd.values())))).dtype
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=mlp_dtype)
-    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=mlp_dtype)
+        mlp_dtype = template_sd.get("mlp_up_bank", next(iter(template_sd.values()))).dtype
+        out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=mlp_dtype)
+        out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=mlp_dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1835,6 +1955,7 @@ def main() -> None:
         num_shared_mlps=args.num_shared_mlps,
         layer_groups=args.layer_groups,
         mlp_layer_bias=args.mlp_layer_bias,
+        mlp_pool_routing=args.mlp_pool_routing,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1852,6 +1973,8 @@ def main() -> None:
             base_model.adapter_down_B.data = base_model.adapter_down_B.data.float()
     if base_model.mlp_hidden_bias is not None:
         base_model.mlp_hidden_bias.data = base_model.mlp_hidden_bias.data.float()
+    if base_model.mlp_routers is not None:
+        base_model.mlp_routers.data = base_model.mlp_routers.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1887,6 +2010,8 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.mlp_hidden_bias is not None:
         scalar_params.append(base_model.mlp_hidden_bias)
+    if base_model.mlp_routers is not None:
+        scalar_params.append(base_model.mlp_routers)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -2106,9 +2231,17 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            route_info = ""
+            if hasattr(base_model, '_routing_pick_counts') and base_model._routing_pick_counts is not None:
+                pc = base_model._routing_pick_counts
+                total = int(pc.numel())
+                unpicked = int((pc == 0).sum().item())
+                multi = int((pc >= 2).sum().item())
+                route_info = f" route:unpicked={unpicked}/{total}({100*unpicked/total:.0f}%) 2+experts={multi}"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{route_info}"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
@@ -2276,29 +2409,52 @@ def main() -> None:
         map_location="cpu",
     )
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], quant_sd)
-    # Re-bank the dequantized tensors (reconstruct effective MLP weights from shared+adapter)
-    # Eval model uses standard bank architecture (adapter_rank=0) for simplicity
-    eval_model = GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=0, mtp_loss_weight=0.0,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        gated_attention=args.gated_attention, value_residual=args.value_residual,
-        adapter_rank=0, num_shared_mlps=0,  # eval uses standard banks
-        mlp_layer_bias=args.mlp_layer_bias,
-    ).to(device).bfloat16()
-    eval_template = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, eval_template,
-                                   layer_to_group=layer_to_group)
-    eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-    eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    # Eval model: routed models keep pool routing, non-routed rebank to standard banks
+    if args.mlp_pool_routing:
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+            adapter_rank=0, num_shared_mlps=args.num_shared_mlps,
+            mlp_layer_bias=args.mlp_layer_bias, mlp_pool_routing=True,
+        ).to(device).bfloat16()
+        eval_template = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
+        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, eval_template,
+                                       layer_to_group=layer_to_group)
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
+        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_shared_up.data = eval_model.mlp_shared_up.data.float()
+        eval_model.mlp_shared_down.data = eval_model.mlp_shared_down.data.float()
+        eval_model.mlp_routers.data = eval_model.mlp_routers.data.float()
+    else:
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+            adapter_rank=0, num_shared_mlps=0,
+            mlp_layer_bias=args.mlp_layer_bias,
+        ).to(device).bfloat16()
+        eval_template = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
+        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, eval_template,
+                                       layer_to_group=layer_to_group)
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
+        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
