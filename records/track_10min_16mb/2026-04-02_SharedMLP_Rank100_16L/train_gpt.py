@@ -98,6 +98,7 @@ class Hyperparameters:
     adapter_rank = int(os.environ.get("ADAPTER_RANK", 100))
     num_shared_mlps = int(os.environ.get("NUM_SHARED_MLPS", 3))
     layer_groups = os.environ.get("LAYER_GROUPS", "")
+    mlp_layer_bias = bool(int(os.environ.get("MLP_LAYER_BIAS", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -736,9 +737,12 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         # No CastedLinear -- weights come from banks
-    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor, hidden_bias: Tensor | None = None) -> Tensor:
+        h = F.linear(x, up_w.to(x.dtype))
+        if hidden_bias is not None:
+            h = h + hidden_bias.to(h.dtype)
+        h = F.leaky_relu(h, negative_slope=0.5).square()
+        return F.linear(h, down_w.to(x.dtype))
 
 class Block(nn.Module):
     def __init__(
@@ -771,12 +775,12 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None, mlp_hidden_bias: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w, hidden_bias=mlp_hidden_bias)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -812,6 +816,7 @@ class GPT(nn.Module):
         adapter_rank: int = 0,
         num_shared_mlps: int = 0,
         layer_groups: str = "",
+        mlp_layer_bias: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -871,6 +876,11 @@ class GPT(nn.Module):
             self.adapter_down_B = None
             self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
             self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        # Per-layer MLP hidden bias (optional, for layer identity encoding)
+        if mlp_layer_bias:
+            self.mlp_hidden_bias = nn.Parameter(torch.zeros(num_layers, mlp_dim))
+        else:
+            self.mlp_hidden_bias = None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -985,10 +995,11 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             up_w, down_w = self._effective_mlp_weights(i)
+            hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], up_w, down_w,
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -998,10 +1009,11 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
             up_w, down_w = self._effective_mlp_weights(bi)
+            hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], up_w, down_w,
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1045,10 +1057,11 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             up_w, down_w = self._effective_mlp_weights(i)
+            hb = self.mlp_hidden_bias[i] if self.mlp_hidden_bias is not None else None
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], up_w, down_w,
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1058,10 +1071,11 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
             up_w, down_w = self._effective_mlp_weights(bi)
+            hb = self.mlp_hidden_bias[bi] if self.mlp_hidden_bias is not None else None
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], up_w, down_w,
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, mlp_hidden_bias=hb)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1820,6 +1834,7 @@ def main() -> None:
         adapter_rank=args.adapter_rank,
         num_shared_mlps=args.num_shared_mlps,
         layer_groups=args.layer_groups,
+        mlp_layer_bias=args.mlp_layer_bias,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1835,6 +1850,8 @@ def main() -> None:
             base_model.adapter_up_B.data = base_model.adapter_up_B.data.float()
             base_model.adapter_down_A.data = base_model.adapter_down_A.data.float()
             base_model.adapter_down_B.data = base_model.adapter_down_B.data.float()
+    if base_model.mlp_hidden_bias is not None:
+        base_model.mlp_hidden_bias.data = base_model.mlp_hidden_bias.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1868,6 +1885,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
+    if base_model.mlp_hidden_bias is not None:
+        scalar_params.append(base_model.mlp_hidden_bias)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -2271,6 +2290,7 @@ def main() -> None:
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         adapter_rank=0, num_shared_mlps=0,  # eval uses standard banks
+        mlp_layer_bias=args.mlp_layer_bias,
     ).to(device).bfloat16()
     eval_template = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, eval_template,
