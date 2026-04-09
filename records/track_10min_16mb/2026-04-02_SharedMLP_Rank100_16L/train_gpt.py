@@ -25,6 +25,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
+_SCATTERMOE_AVAILABLE = False
+if int(os.environ.get("MLP_POOL_ROUTING", "0")) and int(os.environ.get("USE_SCATTERMOE", "0")):
+    from scattermoe.mlp import MLP as ScatterMoEMLP  # fails loudly if not installed
+    _SCATTERMOE_AVAILABLE = True
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -103,6 +107,7 @@ class Hyperparameters:
     moe_balance_gamma = float(os.environ.get("MOE_BALANCE_GAMMA", 0.001))
     moe_balance_alpha = float(os.environ.get("MOE_BALANCE_ALPHA", 0.0001))
     moe_routed_layers = os.environ.get("MOE_ROUTED_LAYERS", "")  # e.g. "3,5,7,9" — empty = all layers
+    use_scattermoe = bool(int(os.environ.get("USE_SCATTERMOE", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -737,6 +742,11 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+class LeakyReLUSquared(nn.Module):
+    """Custom activation for ScatterMoE: LeakyReLU(0.5) followed by squaring."""
+    def forward(self, x: Tensor) -> Tensor:
+        return F.leaky_relu(x, negative_slope=0.5).square()
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -831,6 +841,7 @@ class GPT(nn.Module):
         mlp_pool_routing: bool = False,
         moe_balance_alpha: float = 0.0001,
         moe_routed_layers: str = "",
+        use_scattermoe: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -859,14 +870,24 @@ class GPT(nn.Module):
         # Shared MLP bases + low-rank per-layer adapters
         self.adapter_rank = adapter_rank
         self.num_shared_mlps = num_shared_mlps
+        self._use_scattermoe = use_scattermoe and _SCATTERMOE_AVAILABLE and mlp_pool_routing and num_shared_mlps > 0
         if num_shared_mlps > 0:
             if layer_groups:
                 self.layer_to_group = [int(x) for x in layer_groups.split(",")]
             else:
                 self.layer_to_group = [min(i * num_shared_mlps // num_layers, num_shared_mlps - 1)
                                        for i in range(num_layers)]
-            self.mlp_shared_up = nn.Parameter(torch.empty(num_shared_mlps, mlp_dim, model_dim))
-            self.mlp_shared_down = nn.Parameter(torch.empty(num_shared_mlps, model_dim, mlp_dim))
+            if self._use_scattermoe:
+                self.scattermoe_mlp = ScatterMoEMLP(
+                    input_size=model_dim, hidden_size=mlp_dim,
+                    activation=LeakyReLUSquared(), num_experts=num_shared_mlps, top_k=1,
+                )
+                self.mlp_shared_up = None
+                self.mlp_shared_down = None
+            else:
+                self.scattermoe_mlp = None
+                self.mlp_shared_up = nn.Parameter(torch.empty(num_shared_mlps, mlp_dim, model_dim))
+                self.mlp_shared_down = nn.Parameter(torch.empty(num_shared_mlps, model_dim, mlp_dim))
             if adapter_rank > 0:
                 r = adapter_rank
                 self.adapter_up_A = nn.Parameter(torch.empty(num_layers, mlp_dim, r))
@@ -901,7 +922,11 @@ class GPT(nn.Module):
             self.mlp_routers = nn.Parameter(torch.randn(num_layers, model_dim, num_shared_mlps) * 0.01)
             self.register_buffer('expert_bias', torch.zeros(num_shared_mlps))
             self._moe_balance_alpha = moe_balance_alpha
-            self._moe_routed_layers = set(int(x) for x in moe_routed_layers.split(",") if x.strip()) if moe_routed_layers else set(range(num_layers))
+            if self._use_scattermoe:
+                # ScatterMoE replaces mlp_shared_up/down → all layers MUST be routed
+                self._moe_routed_layers = set(range(num_layers))
+            else:
+                self._moe_routed_layers = set(int(x) for x in moe_routed_layers.split(",") if x.strip()) if moe_routed_layers else set(range(num_layers))
         else:
             self.mlp_routers = None
             self.expert_bias = None
@@ -998,53 +1023,61 @@ class GPT(nn.Module):
             return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
     def _pool_routed_mlp_forward(self, x: Tensor, layer_idx: int) -> Tensor:
-        """DeepSeek-V3 style routing: sigmoid scoring, bias-based selection, expert-choice bmm."""
+        """DeepSeek-V3 style routing: sigmoid scoring, bias-based selection."""
         B, T, D = x.shape
         BT = B * T
         K = self.num_shared_mlps
-        tpe = BT // K
         x_flat = x.reshape(BT, D)
         # DeepSeek-V3: sigmoid scoring (independent per-expert, not competing)
         raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
         scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K] each in [0,1]
-        # Expert choice with bias: bias steers SELECTION, gate from ORIGINAL scores
+        # Selection with bias (bias for SELECTION only, gate from ORIGINAL scores)
         biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
-        expert_biased_T = biased.T  # [K, BT]
-        _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
-        # Gate values from ORIGINAL scores (no bias in gate)
-        selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
-        # Gather tokens per expert
-        x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
-                             top_idxs.unsqueeze(-1).expand(-1, -1, D))  # [K, tpe, D]
-        # Batched MLP forward
-        pool_up = self.mlp_shared_up.to(x_sel.dtype)
-        pool_down = self.mlp_shared_down.to(x_sel.dtype)
-        h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
-        if self.mlp_hidden_bias is not None:
-            h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
-        h = F.leaky_relu(h, negative_slope=0.5).square()
-        y = torch.bmm(h, pool_down.transpose(-1, -2))
-        # Weight by gate value
-        y = y * selected_gates.unsqueeze(-1)
-        # Scatter back
-        output = torch.zeros(BT, D, device=x.device, dtype=y.dtype)
-        flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
-        output.scatter_add_(0, flat_idxs, y.reshape(-1, D))
-        # Renormalize: each token's total gate weight → 1.0
-        gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y.dtype)
-        gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
-        gate_sums = gate_sums.clamp(min=1e-6)
-        output = output / gate_sums
-        # Balance loss + routing stats (layer 0 only)
-        if layer_idx == 0 and self.training:
-            # Expert counts: each expert gets exactly tpe tokens (expert choice)
-            expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
-            self._expert_counts = expert_counts
-            # DeepSeek-V3 auxiliary balance loss (tiny, α=0.0001)
-            f = expert_counts / expert_counts.sum()  # [K] uniform for expert choice
-            P = scores.float().mean(0)  # [K] mean affinity
-            self._moe_balance_loss = K * (f.detach() * P).sum()
-        return output.reshape(B, T, D)
+        if self._use_scattermoe:
+            # TOKEN CHOICE: each token picks top-1 expert → ScatterMoE fused kernel
+            _, k_idxs = biased.topk(1, dim=-1)  # [BT, 1]
+            k_weights = scores.gather(-1, k_idxs)  # [BT, 1] gate from original scores
+            y = self.scattermoe_mlp(x_flat, k_weights.squeeze(-1), k_idxs.squeeze(-1))
+            # Balance loss + stats (token choice: counts vary per expert)
+            if layer_idx == 0 and self.training:
+                expert_counts = torch.zeros(K, device=x.device, dtype=torch.float32)
+                expert_counts.scatter_add_(0, k_idxs.squeeze(-1),
+                                          torch.ones(BT, device=x.device, dtype=torch.float32))
+                self._expert_counts = expert_counts
+                f = expert_counts / expert_counts.sum()
+                P = scores.float().mean(0)
+                self._moe_balance_loss = K * (f.detach() * P).sum()
+        else:
+            # EXPERT CHOICE: each expert picks top tokens → manual gather/bmm/scatter
+            tpe = BT // K
+            expert_biased_T = biased.T  # [K, BT]
+            _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
+            selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
+            x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
+                                 top_idxs.unsqueeze(-1).expand(-1, -1, D))
+            pool_up = self.mlp_shared_up.to(x_sel.dtype)
+            pool_down = self.mlp_shared_down.to(x_sel.dtype)
+            h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
+            if self.mlp_hidden_bias is not None:
+                h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
+            h = F.leaky_relu(h, negative_slope=0.5).square()
+            y_exp = torch.bmm(h, pool_down.transpose(-1, -2))
+            y_exp = y_exp * selected_gates.unsqueeze(-1)
+            output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
+            flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
+            output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
+            gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
+            gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
+            gate_sums = gate_sums.clamp(min=1e-6)
+            y = output / gate_sums
+            # Balance loss + stats (expert choice: perfectly balanced)
+            if layer_idx == 0 and self.training:
+                expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
+                self._expert_counts = expert_counts
+                f = expert_counts / expert_counts.sum()
+                P = scores.float().mean(0)
+                self._moe_balance_loss = K * (f.detach() * P).sum()
+        return y.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -1342,6 +1375,8 @@ def _classify_param(name: str) -> str:
         return "embed"
     if "mlp_routers" in name:
         return "other"
+    if "scattermoe" in name:
+        return "mlp"
     if "shared_mlp" in name:
         return "mlp"
     if ".adapter." in name:
@@ -1581,6 +1616,13 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int,
         if vk in sd: kv_slices[n + i] = sd[vk]; consumed.add(vk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
+    # ScatterMoE: skip MLP rebanking — ScatterMoE weights pass through directly
+    has_scattermoe = any(k.startswith("scattermoe_mlp.") for k in sd)
+    if has_scattermoe:
+        for name, tensor in sd.items():
+            if name not in consumed:
+                out[name] = tensor
+        return out
     template_has_shared = "mlp_shared_up" in template_sd
     if has_shared and layer_to_group and template_has_shared:
         # Routed eval: restack shared MLPs from per-group keys (no expansion to per-layer)
@@ -1974,6 +2016,7 @@ def main() -> None:
         mlp_pool_routing=args.mlp_pool_routing,
         moe_balance_alpha=args.moe_balance_alpha,
         moe_routed_layers=args.moe_routed_layers,
+        use_scattermoe=args.use_scattermoe,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1989,6 +2032,9 @@ def main() -> None:
             base_model.adapter_up_B.data = base_model.adapter_up_B.data.float()
             base_model.adapter_down_A.data = base_model.adapter_down_A.data.float()
             base_model.adapter_down_B.data = base_model.adapter_down_B.data.float()
+    if hasattr(base_model, 'scattermoe_mlp') and base_model.scattermoe_mlp is not None:
+        for p in base_model.scattermoe_mlp.parameters():
+            p.data = p.data.float()
     if base_model.mlp_hidden_bias is not None:
         base_model.mlp_hidden_bias.data = base_model.mlp_hidden_bias.data.float()
     if base_model.mlp_routers is not None:
@@ -2017,6 +2063,8 @@ def main() -> None:
                 base_model.adapter_up_A, base_model.adapter_up_B,
                 base_model.adapter_down_A, base_model.adapter_down_B,
             ]
+    # ScatterMoE params tracked separately — added to scalar_params (Adam) below
+    # since we don't know the weight shapes for Muon compatibility
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
@@ -2030,6 +2078,9 @@ def main() -> None:
         scalar_params.append(base_model.mlp_hidden_bias)
     if base_model.mlp_routers is not None:
         scalar_params.append(base_model.mlp_routers)
+    if hasattr(base_model, 'scattermoe_mlp') and base_model.scattermoe_mlp is not None:
+        for p in base_model.scattermoe_mlp.parameters():
+            scalar_params.append(p)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -2449,14 +2500,19 @@ def main() -> None:
             gated_attention=args.gated_attention, value_residual=args.value_residual,
             adapter_rank=0, num_shared_mlps=args.num_shared_mlps,
             mlp_layer_bias=args.mlp_layer_bias, mlp_pool_routing=True,
+            use_scattermoe=args.use_scattermoe,
         ).to(device).bfloat16()
         eval_template = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
         deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, eval_template,
                                        layer_to_group=layer_to_group)
         eval_model.qo_bank.data = eval_model.qo_bank.data.float()
         eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-        eval_model.mlp_shared_up.data = eval_model.mlp_shared_up.data.float()
-        eval_model.mlp_shared_down.data = eval_model.mlp_shared_down.data.float()
+        if eval_model.mlp_shared_up is not None:
+            eval_model.mlp_shared_up.data = eval_model.mlp_shared_up.data.float()
+            eval_model.mlp_shared_down.data = eval_model.mlp_shared_down.data.float()
+        if hasattr(eval_model, 'scattermoe_mlp') and eval_model.scattermoe_mlp is not None:
+            for p in eval_model.scattermoe_mlp.parameters():
+                p.data = p.data.float()
         eval_model.mlp_routers.data = eval_model.mlp_routers.data.float()
     else:
         eval_model = GPT(
