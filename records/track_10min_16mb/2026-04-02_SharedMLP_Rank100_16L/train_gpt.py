@@ -1036,7 +1036,7 @@ class GPT(nn.Module):
         raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
         scores = F.softmax(raw_scores.float(), dim=-1).to(raw_scores.dtype)  # [BT, K]
         # Selection with bias (for load balancing)
-        biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
+        biased = (scores + self.expert_bias.to(scores.dtype)) if self.expert_bias is not None else scores
         # Balance loss: accumulate across all routed layers
         if self.training:
             P = scores.float().mean(0)
