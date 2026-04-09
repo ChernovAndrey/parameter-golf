@@ -881,7 +881,8 @@ class GPT(nn.Module):
             if self._use_scattermoe:
                 self.scattermoe_mlp = ScatterMoEMLP(
                     input_size=model_dim, hidden_size=mlp_dim,
-                    activation=LeakyReLUSquared(), num_experts=num_shared_mlps, top_k=1,
+                    activation=LeakyReLUSquared(), num_experts=num_shared_mlps,
+                    top_k=int(os.environ.get("MOE_TOP_K", 1)),
                 )
                 self.mlp_shared_up = None
                 self.mlp_shared_down = None
@@ -1025,17 +1026,16 @@ class GPT(nn.Module):
             return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
     def _pool_routed_mlp_forward(self, x: Tensor, layer_idx: int) -> Tensor:
-        """MoE routing: sigmoid scoring, expert-choice with capacity factor C=top_k."""
+        """MoE routing: softmax scoring, token-choice top-k with gate normalization."""
         B, T, D = x.shape
         BT = B * T
         K = self.num_shared_mlps
-        C = self._moe_top_k  # capacity factor: each expert picks C * BT/K tokens
-        tpe = C * BT // K  # tokens per expert
+        top_k = self._moe_top_k
         x_flat = x.reshape(BT, D)
-        # Sigmoid scoring (independent per-expert)
+        # Softmax scoring across experts per token
         raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
         scores = F.softmax(raw_scores.float(), dim=-1).to(raw_scores.dtype)  # [BT, K]
-        # Selection with bias
+        # Selection with bias (for load balancing)
         biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
         # Balance loss: accumulate across all routed layers
         if self.training:
@@ -1048,31 +1048,42 @@ class GPT(nn.Module):
         # Routing diagnostics (layer 0 only)
         if layer_idx == 0 and self.training:
             self._routing_mean_gate = scores.float().mean()
-        # Expert choice: each expert picks top tpe tokens
-        expert_biased_T = biased.T  # [K, BT]
-        _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
-        selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
-        x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
-                             top_idxs.unsqueeze(-1).expand(-1, -1, D))
-        pool_up = self.mlp_shared_up.to(x_sel.dtype)
-        pool_down = self.mlp_shared_down.to(x_sel.dtype)
-        h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
-        if self.mlp_hidden_bias is not None:
-            h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
-        h = F.leaky_relu(h, negative_slope=0.5).square()
-        y_exp = torch.bmm(h, pool_down.transpose(-1, -2))
-        y_exp = y_exp * selected_gates.unsqueeze(-1)
-        output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
-        flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
-        output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
-        gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
-        gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
-        gate_sums = gate_sums.clamp(min=1e-6)
-        y = output / gate_sums
+        # Token choice: each token picks top-k experts
+        _, k_idxs = biased.topk(top_k, dim=-1)  # [BT, top_k]
+        k_weights = scores.gather(-1, k_idxs)  # [BT, top_k]
+        # Normalize selected gates so they sum to 1 per token
+        k_weights = k_weights / k_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        if self._use_scattermoe:
+            # ScatterMoE fused gather-matmul-scatter (Triton kernels)
+            y_flat = self.scattermoe_mlp(x_flat, k_weights, k_idxs)
+        else:
+            # Manual expert-choice fallback with gather/bmm/scatter
+            C = top_k
+            tpe = C * BT // K  # tokens per expert
+            expert_biased_T = biased.T  # [K, BT]
+            _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
+            selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
+            x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
+                                 top_idxs.unsqueeze(-1).expand(-1, -1, D))
+            pool_up = self.mlp_shared_up.to(x_sel.dtype)
+            pool_down = self.mlp_shared_down.to(x_sel.dtype)
+            h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
+            if self.mlp_hidden_bias is not None:
+                h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
+            h = F.leaky_relu(h, negative_slope=0.5).square()
+            y_exp = torch.bmm(h, pool_down.transpose(-1, -2))
+            y_exp = y_exp * selected_gates.unsqueeze(-1)
+            output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
+            flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
+            output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
+            gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
+            gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
+            gate_sums = gate_sums.clamp(min=1e-6)
+            y_flat = (output / gate_sums)
         # Routing stats
         if layer_idx == 0 and self.training:
-            self._expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
-        return y.reshape(B, T, D)
+            self._expert_counts = k_idxs.float().histc(bins=K, min=0, max=K - 1)
+        return y_flat.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -1261,7 +1272,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=not args.use_scattermoe)
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -2041,7 +2052,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not args.use_scattermoe)
     model = compiled_model
 
     # Optimizer split:
@@ -2541,7 +2552,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=not args.use_scattermoe)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
