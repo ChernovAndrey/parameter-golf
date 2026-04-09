@@ -100,6 +100,9 @@ class Hyperparameters:
     layer_groups = os.environ.get("LAYER_GROUPS", "")
     mlp_layer_bias = bool(int(os.environ.get("MLP_LAYER_BIAS", "0")))
     mlp_pool_routing = bool(int(os.environ.get("MLP_POOL_ROUTING", "0")))
+    moe_balance_gamma = float(os.environ.get("MOE_BALANCE_GAMMA", 0.001))
+    moe_balance_alpha = float(os.environ.get("MOE_BALANCE_ALPHA", 0.0001))
+    moe_routed_layers = os.environ.get("MOE_ROUTED_LAYERS", "")  # e.g. "3,5,7,9" — empty = all layers
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -826,6 +829,8 @@ class GPT(nn.Module):
         layer_groups: str = "",
         mlp_layer_bias: bool = False,
         mlp_pool_routing: bool = False,
+        moe_balance_alpha: float = 0.0001,
+        moe_routed_layers: str = "",
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -894,8 +899,13 @@ class GPT(nn.Module):
         self.mlp_pool_routing = mlp_pool_routing
         if mlp_pool_routing and num_shared_mlps > 0:
             self.mlp_routers = nn.Parameter(torch.randn(num_layers, model_dim, num_shared_mlps) * 0.01)
+            self.register_buffer('expert_bias', torch.zeros(num_shared_mlps))
+            self._moe_balance_alpha = moe_balance_alpha
+            self._moe_routed_layers = set(int(x) for x in moe_routed_layers.split(",") if x.strip()) if moe_routed_layers else set(range(num_layers))
         else:
             self.mlp_routers = None
+            self.expert_bias = None
+            self._moe_balance_alpha = 0.0
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -988,22 +998,22 @@ class GPT(nn.Module):
             return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
     def _pool_routed_mlp_forward(self, x: Tensor, layer_idx: int) -> Tensor:
-        """Expert choice routing: each pool MLP picks its top tokens, processed via bmm."""
+        """DeepSeek-V3 style routing: sigmoid scoring, bias-based selection, expert-choice bmm."""
         B, T, D = x.shape
         BT = B * T
         K = self.num_shared_mlps
         tpe = BT // K
         x_flat = x.reshape(BT, D)
-        # Router scores: [BT, K]
-        scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
-        # Gate values: softmax in float32 for numerical precision
-        gates = F.softmax(scores.float(), dim=-1).to(scores.dtype)  # [BT, K]
-        # Expert choice: each expert picks its top tokens based on raw scores
-        expert_scores = scores.T  # [K, BT]
-        _, top_idxs = expert_scores.topk(tpe, dim=-1)  # [K, tpe]
-        # Gather gate values for selected tokens
-        selected_gates = gates.T.gather(1, top_idxs)  # [K, tpe]
-        # Gather tokens per expert (explicit gather, more compile-friendly than fancy indexing)
+        # DeepSeek-V3: sigmoid scoring (independent per-expert, not competing)
+        raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
+        scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K] each in [0,1]
+        # Expert choice with bias: bias steers SELECTION, gate from ORIGINAL scores
+        biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
+        expert_biased_T = biased.T  # [K, BT]
+        _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
+        # Gate values from ORIGINAL scores (no bias in gate)
+        selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
+        # Gather tokens per expert
         x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
                              top_idxs.unsqueeze(-1).expand(-1, -1, D))  # [K, tpe, D]
         # Batched MLP forward
@@ -1014,7 +1024,7 @@ class GPT(nn.Module):
             h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
         h = F.leaky_relu(h, negative_slope=0.5).square()
         y = torch.bmm(h, pool_down.transpose(-1, -2))
-        # Weight by per-token gate value (softmax across experts)
+        # Weight by gate value
         y = y * selected_gates.unsqueeze(-1)
         # Scatter back
         output = torch.zeros(BT, D, device=x.device, dtype=y.dtype)
@@ -1025,13 +1035,15 @@ class GPT(nn.Module):
         gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
         gate_sums = gate_sums.clamp(min=1e-6)
         output = output / gate_sums
-        # Track routing stats for diagnostics (layer 0 only)
-        # Store raw tensor for logging outside compiled graph (avoid .item() graph break)
+        # Balance loss + routing stats (layer 0 only)
         if layer_idx == 0 and self.training:
-            pick_counts = torch.zeros(BT, device=x.device, dtype=torch.int32)
-            pick_counts.scatter_add_(0, top_idxs.reshape(-1),
-                                     torch.ones(K * tpe, device=x.device, dtype=torch.int32))
-            self._routing_pick_counts = pick_counts  # logged outside forward
+            # Expert counts: each expert gets exactly tpe tokens (expert choice)
+            expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
+            self._expert_counts = expert_counts
+            # DeepSeek-V3 auxiliary balance loss (tiny, α=0.0001)
+            f = expert_counts / expert_counts.sum()  # [K] uniform for expert choice
+            P = scores.float().mean(0)  # [K] mean affinity
+            self._moe_balance_loss = K * (f.detach() * P).sum()
         return output.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
@@ -1055,7 +1067,7 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            if self.mlp_routers is not None:
+            if self.mlp_routers is not None and i in self._moe_routed_layers:
                 x_attn, raw_v, x_in = self.blocks[i].forward_attn_only(
                     x, x0, self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                     self.qo_bank[n + i], v_embed=ve, v0=v0)
@@ -1080,7 +1092,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            if self.mlp_routers is not None:
+            if self.mlp_routers is not None and bi in self._moe_routed_layers:
                 x_attn, _, x_in = self.blocks[bi].forward_attn_only(
                     x, x0, self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                     self.qo_bank[n + bi], v_embed=ve, v0=v0)
@@ -1124,6 +1136,9 @@ class GPT(nn.Module):
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+        # MoE balance loss (DeepSeek-V3 style, tiny α=0.0001)
+        if self.training and self._moe_balance_alpha > 0 and hasattr(self, '_moe_balance_loss') and self._moe_balance_loss is not None:
+            main_loss = main_loss + self._moe_balance_alpha * self._moe_balance_loss
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
@@ -1139,7 +1154,7 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            if self.mlp_routers is not None:
+            if self.mlp_routers is not None and i in self._moe_routed_layers:
                 x_attn, raw_v, x_in = self.blocks[i].forward_attn_only(
                     x, x0, self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                     self.qo_bank[n + i], v_embed=ve, v0=v0)
@@ -1164,7 +1179,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            if self.mlp_routers is not None:
+            if self.mlp_routers is not None and bi in self._moe_routed_layers:
                 x_attn, _, x_in = self.blocks[bi].forward_attn_only(
                     x, x0, self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                     self.qo_bank[n + bi], v_embed=ve, v0=v0)
@@ -1957,6 +1972,8 @@ def main() -> None:
         layer_groups=args.layer_groups,
         mlp_layer_bias=args.mlp_layer_bias,
         mlp_pool_routing=args.mlp_pool_routing,
+        moe_balance_alpha=args.moe_balance_alpha,
+        moe_routed_layers=args.moe_routed_layers,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2214,6 +2231,13 @@ def main() -> None:
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+        # DeepSeek-V3 expert bias update (outside compiled graph)
+        if hasattr(base_model, 'expert_bias') and base_model.expert_bias is not None:
+            if hasattr(base_model, '_expert_counts') and base_model._expert_counts is not None:
+                with torch.no_grad():
+                    counts = base_model._expert_counts.float()
+                    mean_c = counts.sum() / counts.numel()
+                    base_model.expert_bias += args.moe_balance_gamma * (mean_c - counts) / max(mean_c.item(), 1.0)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
@@ -2233,12 +2257,12 @@ def main() -> None:
         )
         if should_log_train:
             route_info = ""
-            if hasattr(base_model, '_routing_pick_counts') and base_model._routing_pick_counts is not None:
-                pc = base_model._routing_pick_counts
-                total = int(pc.numel())
-                unpicked = int((pc == 0).sum().item())
-                multi = int((pc >= 2).sum().item())
-                route_info = f" route:unpicked={unpicked}/{total}({100*unpicked/total:.0f}%) 2+experts={multi}"
+            if hasattr(base_model, '_expert_counts') and base_model._expert_counts is not None:
+                c = base_model._expert_counts
+                route_info = f" route:min={int(c.min().item())}/max={int(c.max().item())}/avg={int(c.sum().item())//max(c.numel(),1)}"
+                if hasattr(base_model, 'expert_bias') and base_model.expert_bias is not None:
+                    eb = base_model.expert_bias
+                    route_info += f" bias:{eb.min().item():.3f}/{eb.max().item():.3f}"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
