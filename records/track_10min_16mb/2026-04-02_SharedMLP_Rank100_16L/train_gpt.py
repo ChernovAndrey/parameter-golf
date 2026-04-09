@@ -104,6 +104,7 @@ class Hyperparameters:
     layer_groups = os.environ.get("LAYER_GROUPS", "")
     mlp_layer_bias = bool(int(os.environ.get("MLP_LAYER_BIAS", "0")))
     mlp_pool_routing = bool(int(os.environ.get("MLP_POOL_ROUTING", "0")))
+    moe_top_k = int(os.environ.get("MOE_TOP_K", 1))
     moe_balance_gamma = float(os.environ.get("MOE_BALANCE_GAMMA", 0.001))
     moe_balance_alpha = float(os.environ.get("MOE_BALANCE_ALPHA", 0.0001))
     moe_routed_layers = os.environ.get("MOE_ROUTED_LAYERS", "")  # e.g. "3,5,7,9" — empty = all layers
@@ -922,6 +923,7 @@ class GPT(nn.Module):
             self.mlp_routers = nn.Parameter(torch.randn(num_layers, model_dim, num_shared_mlps) * 0.01)
             self.register_buffer('expert_bias', torch.zeros(num_shared_mlps))
             self._moe_balance_alpha = moe_balance_alpha
+            self._moe_top_k = int(os.environ.get("MOE_TOP_K", 1))
             if self._use_scattermoe:
                 # ScatterMoE replaces mlp_shared_up/down → all layers MUST be routed
                 self._moe_routed_layers = set(range(num_layers))
@@ -1023,64 +1025,53 @@ class GPT(nn.Module):
             return self.mlp_shared_up[g], self.mlp_shared_down[g]
         return self.mlp_up_bank[i], self.mlp_down_bank[i]
     def _pool_routed_mlp_forward(self, x: Tensor, layer_idx: int) -> Tensor:
-        """DeepSeek-V3 style routing: sigmoid scoring, bias-based selection."""
+        """MoE routing: sigmoid scoring, expert-choice with capacity factor C=top_k."""
         B, T, D = x.shape
         BT = B * T
         K = self.num_shared_mlps
+        C = self._moe_top_k  # capacity factor: each expert picks C * BT/K tokens
+        tpe = C * BT // K  # tokens per expert
         x_flat = x.reshape(BT, D)
-        # DeepSeek-V3: sigmoid scoring (independent per-expert, not competing)
+        # Sigmoid scoring (independent per-expert)
         raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
-        scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K] each in [0,1]
-        # Selection with bias (bias for SELECTION only, gate from ORIGINAL scores)
+        scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K]
+        # Selection with bias
         biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
         # Balance loss: accumulate across all routed layers
         if self.training:
-            P = scores.float().mean(0)  # [K] mean affinity
+            P = scores.float().mean(0)
             layer_bal = P.sum()
             if self._moe_balance_loss is None:
                 self._moe_balance_loss = layer_bal
             else:
                 self._moe_balance_loss = self._moe_balance_loss + layer_bal
-        # Routing diagnostics: store on layer 0 only (tensors, no .item() for compile)
+        # Routing diagnostics (layer 0 only)
         if layer_idx == 0 and self.training:
-            self._routing_mean_gate = scores.float().mean()  # avg sigmoid value
-        if self._use_scattermoe:
-            # TOKEN CHOICE: each token picks top-1 expert → ScatterMoE fused kernel
-            _, k_idxs = biased.topk(1, dim=-1)  # [BT, 1]
-            k_weights = scores.gather(-1, k_idxs)  # [BT, 1] gate from original scores
-            y = self.scattermoe_mlp(x_flat, k_weights.squeeze(-1), k_idxs.squeeze(-1))
-            # Routing stats for bias update (token choice: counts vary per expert)
-            if layer_idx == 0 and self.training:
-                expert_counts = torch.zeros(K, device=x.device, dtype=torch.float32)
-                expert_counts.scatter_add_(0, k_idxs.squeeze(-1),
-                                          torch.ones(BT, device=x.device, dtype=torch.float32))
-                self._expert_counts = expert_counts
-        else:
-            # EXPERT CHOICE: each expert picks top tokens → manual gather/bmm/scatter
-            tpe = BT // K
-            expert_biased_T = biased.T  # [K, BT]
-            _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
-            selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
-            x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
-                                 top_idxs.unsqueeze(-1).expand(-1, -1, D))
-            pool_up = self.mlp_shared_up.to(x_sel.dtype)
-            pool_down = self.mlp_shared_down.to(x_sel.dtype)
-            h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
-            if self.mlp_hidden_bias is not None:
-                h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
-            h = F.leaky_relu(h, negative_slope=0.5).square()
-            y_exp = torch.bmm(h, pool_down.transpose(-1, -2))
-            y_exp = y_exp * selected_gates.unsqueeze(-1)
-            output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
-            flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
-            output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
-            gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
-            gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
-            gate_sums = gate_sums.clamp(min=1e-6)
-            y = output / gate_sums
-            # Routing stats (expert choice: perfectly balanced)
-            if layer_idx == 0 and self.training:
-                self._expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
+            self._routing_mean_gate = scores.float().mean()
+        # Expert choice: each expert picks top tpe tokens
+        expert_biased_T = biased.T  # [K, BT]
+        _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
+        selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
+        x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
+                             top_idxs.unsqueeze(-1).expand(-1, -1, D))
+        pool_up = self.mlp_shared_up.to(x_sel.dtype)
+        pool_down = self.mlp_shared_down.to(x_sel.dtype)
+        h = torch.bmm(x_sel, pool_up.transpose(-1, -2))
+        if self.mlp_hidden_bias is not None:
+            h = h + self.mlp_hidden_bias[layer_idx].to(h.dtype)
+        h = F.leaky_relu(h, negative_slope=0.5).square()
+        y_exp = torch.bmm(h, pool_down.transpose(-1, -2))
+        y_exp = y_exp * selected_gates.unsqueeze(-1)
+        output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
+        flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
+        output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
+        gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
+        gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
+        gate_sums = gate_sums.clamp(min=1e-6)
+        y = output / gate_sums
+        # Routing stats
+        if layer_idx == 0 and self.training:
+            self._expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
         return y.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
