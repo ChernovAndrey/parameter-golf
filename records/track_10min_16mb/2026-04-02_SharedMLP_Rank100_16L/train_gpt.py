@@ -1034,7 +1034,7 @@ class GPT(nn.Module):
         x_flat = x.reshape(BT, D)
         # Sigmoid scoring (independent per-expert)
         raw_scores = F.linear(x_flat, self.mlp_routers[layer_idx].T.to(x_flat.dtype))
-        scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K]
+        scores = F.softmax(raw_scores.float(), dim=-1).to(raw_scores.dtype)  # [BT, K]
         # Selection with bias
         biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
         # Balance loss: accumulate across all routed layers
