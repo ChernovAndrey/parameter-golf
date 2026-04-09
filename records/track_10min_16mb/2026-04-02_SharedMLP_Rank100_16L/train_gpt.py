@@ -1033,20 +1033,28 @@ class GPT(nn.Module):
         scores = torch.sigmoid(raw_scores.float()).to(raw_scores.dtype)  # [BT, K] each in [0,1]
         # Selection with bias (bias for SELECTION only, gate from ORIGINAL scores)
         biased = scores + self.expert_bias.to(scores.dtype) if self.expert_bias is not None else scores
+        # Balance loss: accumulate across all routed layers
+        if self.training:
+            P = scores.float().mean(0)  # [K] mean affinity
+            layer_bal = P.sum()
+            if self._moe_balance_loss is None:
+                self._moe_balance_loss = layer_bal
+            else:
+                self._moe_balance_loss = self._moe_balance_loss + layer_bal
+        # Routing diagnostics: store on layer 0 only (tensors, no .item() for compile)
+        if layer_idx == 0 and self.training:
+            self._routing_mean_gate = scores.float().mean()  # avg sigmoid value
         if self._use_scattermoe:
             # TOKEN CHOICE: each token picks top-1 expert → ScatterMoE fused kernel
             _, k_idxs = biased.topk(1, dim=-1)  # [BT, 1]
             k_weights = scores.gather(-1, k_idxs)  # [BT, 1] gate from original scores
             y = self.scattermoe_mlp(x_flat, k_weights.squeeze(-1), k_idxs.squeeze(-1))
-            # Balance loss + stats (token choice: counts vary per expert)
+            # Routing stats for bias update (token choice: counts vary per expert)
             if layer_idx == 0 and self.training:
                 expert_counts = torch.zeros(K, device=x.device, dtype=torch.float32)
                 expert_counts.scatter_add_(0, k_idxs.squeeze(-1),
                                           torch.ones(BT, device=x.device, dtype=torch.float32))
                 self._expert_counts = expert_counts
-                f = expert_counts / expert_counts.sum()
-                P = scores.float().mean(0)
-                self._moe_balance_loss = K * (f.detach() * P).sum()
         else:
             # EXPERT CHOICE: each expert picks top tokens → manual gather/bmm/scatter
             tpe = BT // K
@@ -1070,13 +1078,9 @@ class GPT(nn.Module):
             gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
             gate_sums = gate_sums.clamp(min=1e-6)
             y = output / gate_sums
-            # Balance loss + stats (expert choice: perfectly balanced)
+            # Routing stats (expert choice: perfectly balanced)
             if layer_idx == 0 and self.training:
-                expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
-                self._expert_counts = expert_counts
-                f = expert_counts / expert_counts.sum()
-                P = scores.float().mean(0)
-                self._moe_balance_loss = K * (f.detach() * P).sum()
+                self._expert_counts = torch.full((K,), tpe, device=x.device, dtype=torch.float32)
         return y.reshape(B, T, D)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
@@ -1089,6 +1093,7 @@ class GPT(nn.Module):
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
+        self._moe_balance_loss = None  # reset per forward pass
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -2314,6 +2319,10 @@ def main() -> None:
                 if hasattr(base_model, 'expert_bias') and base_model.expert_bias is not None:
                     eb = base_model.expert_bias
                     route_info += f" bias:{eb.min().item():.3f}/{eb.max().item():.3f}"
+                if hasattr(base_model, '_routing_mean_gate') and base_model._routing_mean_gate is not None:
+                    route_info += f" gate:{base_model._routing_mean_gate.item():.3f}"
+                if hasattr(base_model, '_moe_balance_loss') and base_model._moe_balance_loss is not None:
+                    route_info += f" bal:{base_model._moe_balance_loss.item():.4f}"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
