@@ -1060,8 +1060,9 @@ class GPT(nn.Module):
             # Manual expert-choice fallback with gather/bmm/scatter
             C = top_k
             tpe = C * BT // K  # tokens per expert
-            expert_biased_T = biased.T  # [K, BT]
-            _, top_idxs = expert_biased_T.topk(tpe, dim=-1)  # [K, tpe]
+            # Select on raw logits (larger dynamic range) + bias, like original
+            raw_biased = raw_scores.T + self.expert_bias.unsqueeze(-1).to(raw_scores.dtype) if self.expert_bias is not None else raw_scores.T
+            _, top_idxs = raw_biased.topk(tpe, dim=-1)  # [K, tpe]
             selected_gates = scores.T.gather(1, top_idxs)  # [K, tpe]
             x_sel = torch.gather(x_flat.unsqueeze(0).expand(K, -1, -1), 1,
                                  top_idxs.unsqueeze(-1).expand(-1, -1, D))
@@ -1076,10 +1077,7 @@ class GPT(nn.Module):
             output = torch.zeros(BT, D, device=x.device, dtype=y_exp.dtype)
             flat_idxs = top_idxs.reshape(-1).unsqueeze(-1).expand(-1, D)
             output.scatter_add_(0, flat_idxs, y_exp.reshape(-1, D))
-            gate_sums = torch.zeros(BT, 1, device=x.device, dtype=y_exp.dtype)
-            gate_sums.scatter_add_(0, flat_idxs[:, :1], selected_gates.reshape(-1, 1))
-            gate_sums = gate_sums.clamp(min=1e-6)
-            y_flat = (output / gate_sums)
+            y_flat = output
         # Routing stats
         if layer_idx == 0 and self.training:
             self._expert_counts = k_idxs.float().histc(bins=K, min=0, max=K - 1)
