@@ -1,10 +1,13 @@
 # Current SOTA Architecture — Parameter Golf Leaderboard
 
-**Submission**: AR Self-Gen GPTQ + XSA-all + BigramHash 3072x112
-**Score**: 1.1147 BPB (3-seed mean, std 0.0004)
-**Author**: abaybektursun | **Date**: 2026-03-25
-**Artifact Size**: ~15.91 MB (limit: 16 MB)
-**Previous SOTA**: 1.1194 BPB (PR #549, same author) | **Improvement**: -0.0046 BPB
+**Submission**: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
+**Score**: 1.0810 BPB (3-seed mean, std 0.0002)
+**Author**: bigbag (PR #1493) | **Date**: 2026-04-09
+**Artifact Size**: ~15.99 MB (limit: 16 MB)
+**Previous SOTA**: 1.0822 BPB (PR #1477, aryanbhosale) | **Improvement**: −0.0012 BPB
+**Last-pulled-before-update SOTA**: 1.1147 BPB (PR #1019) | **Cumulative improvement since last pull**: −0.0337 BPB
+
+> A companion doc, `leaderboard_update_2026-04-21.md`, walks through all 9 records merged between the last pull and this snapshot. A compute-and-artifact breakdown lives in `sota_profile.md`. The per-technique BPB delta table lives in `techniques_impact.md`.
 
 ---
 
@@ -15,308 +18,229 @@
 | Type | Autoregressive causal LM (next-token prediction) |
 | Context length (train) | 2048 tokens |
 | Context length (eval) | 2048 tokens (sliding window, stride 64) |
-| Vocabulary | 1024 BPE tokens (SentencePiece) |
-| Tokenization | Byte-pair encoding via SentencePiece |
+| Vocabulary | **8192 BPE tokens (SentencePiece)** |
+| Tokenization | SentencePiece BPE, tokenizer model ~100 KB |
 | Model dimension | 512 |
-| Layers | 11 (U-Net: 5 encoder + 6 decoder) |
+| Embedding dimension | 512 (`EMBEDDING_DIM`, decoupled from model_dim) |
+| Layers (physical) | 11 (U-Net: 5 encoder + 6 decoder) |
+| Layers (virtual) | **17** (3-layer recurrence on layers 3, 4, 5) |
 | Attention heads | 8 (head_dim = 64) |
 | KV heads | 4 (Grouped Query Attention) |
-| MLP expansion | 3x (hidden = 1536) |
+| XSA | All 11 layers |
+| MLP expansion | **4× (hidden = 2048)** |
 | Tied embeddings | Yes (tok_emb reused as lm_head) |
 | Positional encoding | Partial RoPE (16 of 64 dims) |
+| QK scaling | Learnable per-head q_gain, init **5.25** |
+| Residual structure | **Sequential layers 0–6, Parallel (GPT-J style) layers 7–10** |
+| Skip connections | U-Net + **sigmoid skip gates** (`SKIP_GATES_ENABLED=1`) |
+| Activation | LeakyReLU(0.5)² |
+| Logit softcap | 30.0 |
 | Attention impl | Flash Attention 3 (causal) |
-| Precision | BF16 training, int6 QAT, Full Hessian GPTQ int6 + LZMA preset=9 |
-| Training hardware | 8x H100 SXM 80GB |
-| Training time | 600s (~6,922 steps at 86.7ms/step) |
-| Eval time | Standard sliding window only (no TTT) |
-| TTT | Dropped (neutral/negative on this stack) |
+| Precision | BF16 training, **SDClip Full-Hessian GPTQ**: int6 matrices (k=12.85), int8 embeddings (k=20.0); **byte-shuffle + Brotli-11**; LZMA code wrapper (~16.6 KB code) |
+| Training hardware | 8× H100 SXM 80 GB |
+| Training time | ~588 s (~4,550 steps) |
+| Eval time | ~500 s total (sliding + TTT) |
+| TTT | **Legal Score-First TTT** (Issue #1017 Track B): 32K-token chunks, 3 epochs × SGD lr=0.005 momentum=0.9 with cosine LR decay; score-before-update per chunk |
 
 ---
 
 ## Architecture Overview
 
-### Forward Pass Formulas
+### Depth Recurrence — Virtual-Layer Construction
 
-**Input Processing:**
-```
-x = TokenEmbed(ids) + BigramHash(ids)
-x = SmearGate(RMSNorm(x))
-x₀ = x                                ← saved, fed into every block via residual mixing
-```
-
-**Encoder (layers 0–4) — each layer saves its output:**
-```
-h₀ = Block₀(x, x₀)
-h₁ = Block₁(h₀, x₀)
-h₂ = Block₂(h₁, x₀)
-h₃ = Block₃(h₂, x₀)
-h₄ = Block₄(h₃, x₀)
-```
-
-**Decoder (layers 5–10) — skip connections added in reverse order:**
-```
-x  = Block₅( h₄ + w₀⊙h₄,  x₀)       ← skip from layer 4
-x  = Block₆(  x + w₁⊙h₃,  x₀)       ← skip from layer 3
-x  = Block₇(  x + w₂⊙h₂,  x₀)       ← skip from layer 2
-x  = Block₈(  x + w₃⊙h₁,  x₀)       ← skip from layer 1
-x  = Block₉(  x + w₄⊙h₀,  x₀)       ← skip from layer 0
-x  = Block₁₀( x,           x₀)       ← no skip (6 decoders > 5 encoders)
-```
-
-**Output:**
-```
-logits = 30 · tanh( Linear(RMSNorm(x)) / 30 )       ← Linear reuses tok_emb weights
-```
-
-`w₀..w₄` are learnable 512-dim vectors (per-feature skip scaling).
-`x₀` enters every block via residual mixing: `x_in = mix₀·x + mix₁·x₀`.
-
-### U-Net Skip Connection Structure
-
-The encoder and decoder layers are paired in reverse order, forming a U-shape.
-Deep decoder layers receive shallow encoder features, and vice versa:
+The 11 physical blocks run as a 17-virtual-layer sequence once looping is active (activated at `ENABLE_LOOPING_AT = 0.35`, i.e. 35 % of training):
 
 ```
-Encoder                                                    Decoder
-───────                                                    ───────
-Layer 0  ─── h₀ ──────────────────────────────── +w₄⊙h₀ → Layer 9
-  ↓                                                          ↑
-Layer 1  ─── h₁ ────────────────────────── +w₃⊙h₁ ────→ Layer 8
-  ↓                                                          ↑
-Layer 2  ─── h₂ ──────────────────── +w₂⊙h₂ ──────→ Layer 7
-  ↓                                                          ↑
-Layer 3  ─── h₃ ────────────── +w₁⊙h₃ ────────→ Layer 6
-  ↓                                                          ↑
-Layer 4  ─── h₄ ──────── +w₀⊙h₄ ──────────→ Layer 5
-  ↓                ↑
-  └──── main path ─┘                          Layer 10 (no skip)
-                                                   ↓
-                                                Output
+Encoder virtual sequence  :  0  1  2  3  4  5  3  4
+Decoder virtual sequence  :  5  3  4  5  6  7  8  9  10
+(Encoder length 8, Decoder length 9 — 17 virtual layers total.)
 ```
 
-### Full Architecture (Mermaid)
+Layers 3, 4, 5 are each visited twice inside the loop. Physical-param count is unchanged; effective depth roughly matches a 17-layer dense network on the forward/backward paths where recurrence is active.
 
-```mermaid
-graph TD
-    subgraph Input
-        A[Token IDs<br/>seq_len = 2048] --> B[Token Embedding<br/>1024 × 512]
-        A --> C[BigramHash<br/>3072 x 112 to 512]
-        B --> D((+))
-        C --> D
-        D --> E[RMSNorm]
-        E --> F[SmearGate]
-    end
+### Parallel Residuals — Layer 7+
 
-    F --> X0["x₀ (saved for all blocks)"]
-    X0 --> ENC0
+Layers 0–6 use the classic sequential residual: `h = x + attn_scale · Attn(norm(x)); x_out = h + mlp_scale · MLP(norm(h))`.
 
-    subgraph Encoder
-        ENC0[Block 0] --> ENC1[Block 1]
-        ENC1 --> ENC2[Block 2]
-        ENC2 --> ENC3[Block 3]
-        ENC3 --> ENC4[Block 4]
-    end
+Layers 7–10 compute attention and MLP **in parallel** from the same input (GPT-J style):
 
-    ENC4 --> SKIP4["+ w₀ ⊙ h₄"]
-    SKIP4 --> DEC0
+```
+x_out = x + attn_scale · Attn(norm(x)) + mlp_scale · MLP(norm(x))
+```
 
-    subgraph Decoder
-        DEC0[Block 5] --> SKIP3["+ w₁ ⊙ h₃"]
-        SKIP3 --> DEC1[Block 6]
-        DEC1 --> SKIP2["+ w₂ ⊙ h₂"]
-        SKIP2 --> DEC2[Block 7]
-        DEC2 --> SKIP1["+ w₃ ⊙ h₁"]
-        SKIP1 --> DEC3[Block 8]
-        DEC3 --> SKIP0["+ w₄ ⊙ h₀"]
-        SKIP0 --> DEC4[Block 9]
-        DEC4 --> DEC5[Block 10<br/>no skip]
-    end
+Attention and MLP see the same pre-block input, and their outputs are summed into a single residual. A learned `lane_merge` scalar (init 0.5) blends the attention/MLP lanes in the submissions that carry the two-lane variant (PR #1477); in PR #1493 the recipe is single-lane parallel residual.
 
-    ENC4 -.->|h₄| SKIP4
-    ENC3 -.->|h₃| SKIP3
-    ENC2 -.->|h₂| SKIP2
-    ENC1 -.->|h₁| SKIP1
-    ENC0 -.->|h₀| SKIP0
+### Forward Pass (high-level)
 
-    DEC5 --> FN[RMSNorm]
-    FN --> LM["Tied LM Head<br/>reuses tok_emb weights"]
-    LM --> SC["Logit Softcap<br/>30 · tanh(logits / 30)"]
-    SC --> OUT[Next-Token Probabilities]
+```
+ids  : [B, T]                                           (T = 2048, V = 8192)
+e    = TokEmbed(ids)                                     [B, T, 512]      ← int8 SDClip GPTQ
+                                                             no BigramHash, no SmearGate, no VE128
 
-    style Input fill:#1a1a2e,stroke:#e94560,color:#fff
-    style Encoder fill:#16213e,stroke:#0f3460,color:#fff
-    style Decoder fill:#16213e,stroke:#533483,color:#fff
+e, state = loop_active ? VirtualLayerSequence(e) : DenseLayerSequence(e)
+           where each block is:
+             z     = RMSNorm(x) * LN_scale
+             attn  = FlashAttn3( Partial-RoPE-Q(z)*q_gain, K(z), V(z) )
+             (attention projections go through SDClip-int6 Q/K/V/O)
+             if layer >= PARALLEL_RESIDUAL_START (=7):
+                 mlp   = MLP( RMSNorm(x) * LN_scale )
+                 x_out = x + attn_scale * attn + mlp_scale * mlp
+             else:
+                 x_out = x + attn_scale * attn
+                 x_out = x_out + mlp_scale * MLP( RMSNorm(x_out) * LN_scale )
+
+logits = 30 * tanh( Linear(RMSNorm(e)) / 30 )            Linear weights tied to TokEmbed
+```
+
+### U-Net Skip Gates
+
+The encoder/decoder pairing is preserved, but each skip is now gated:
+`x = lerp(skip, x, sigmoid(skip_gate))`
+`skip_gate` is a small per-feature learnable parameter (`SKIP_GATES_ENABLED=1`). This replaces the hard additive skip (`x = x + w_i ⊙ skip_i`) of the PR #1019 era.
+
+---
+
+## Training Recipe
+
+### Optimizer
+
+- **MuonEq-R** on weight matrices: row-normalize the gradient rows, then Newton–Schulz-5 orthogonalization, then apply update (`MUON_ROW_NORMALIZE = 1`).
+- **AdamW** for embeddings and scalars.
+- **Stratified weight decay**: `MUON_WD = 0.095`, `EMBED_WD = 0.085`, `ADAM_WD = 0.02`.
+- **Stratified learning rates**: `matrix_lr (MLR) = 0.022`, plus separate embed / tied-embed / head / scalar LRs.
+- **Fractional warmdown**: linear decay to LR = 0 over the final `WARMDOWN_FRAC = 0.72` of training.
+- **EMA only** (no SWA): `EMA_DECAY = 0.9965`.
+
+### Depth Recurrence Activation
+
+- `LOOP_LAYERS = 3, 4, 5`
+- `NUM_LOOPS = 1` extra pass (i.e. each of {3,4,5} is visited twice)
+- `ENABLE_LOOPING_AT = 0.35` (activate looping at 35 % of the total step schedule)
+
+Running without recurrence first keeps step time cheap early, then absorbs the recurrence cost after the model has a reasonable initial representation.
+
+### Quantization (post-training)
+
+**SDClip** replaces quantile clip search:
+
+```
+σ_row    = rowwise std of weight matrix
+clip     = k · σ_row
+bits     = MATRIX_BITS (=6) for matrices, EMBED_BITS (=8) for token embeddings
+k        = MATRIX_CLIP_SIGMAS (=12.85) for matrices, EMBED_CLIP_SIGMAS (=20.0) for embeddings
+```
+
+Why: the compressed size of a weight matrix is dominated by the entropy of the quantized values `H(q)`. `H(q)` is controlled by the clip level more than by the bitwidth, and `σ_row` is a cheap principled proxy. Empirically, `RMS(weight) ↔ compressed_ratio` has R² ≈ 0.995 in this regime.
+
+Full-Hessian GPTQ runs on all matrices *including* the token embedding (PR #1394 change — embeddings used to be RTN-quantized). 64 calibration batches; Hessian computed in-training within the 600 s budget.
+
+Artifact pipeline: `SDClip-GPTQ → byte-shuffle → Brotli-11 → final artifact`. No selective pruning is needed (the model fits under 16 MB natively). The `train_gpt.py` source itself is wrapped as `exec(lzma.decompress(base85_blob, …))`, saving ~43 KB vs plain source.
+
+### Test-Time Training — Legal Score-First
+
+Module gated behind `TTT_ENABLED = 1`. Loop per validation chunk:
+
+```python
+for chunk in chunks:
+    # Phase 1 — SCORE (frozen model)
+    with torch.inference_mode():
+        nll = cross_entropy(model(batch), targets)
+    loss_sum += nll.sum()
+
+    # Phase 2 — TRAIN on just-scored chunk
+    if not is_last_chunk:
+        for _ in range(TTT_EPOCHS):           # = 3
+            for x, y in chunk_seqs:
+                (model(x, y)).backward()
+                sgd_step(lr = cosine(TTT_LR = 0.005),
+                         momentum = TTT_MOMENTUM = 0.9,
+                         clip_norm = 1.0)
+```
+
+Chunk size `TTT_CHUNK_TOKENS = 32768`. Each chunk fully scored before it is trained on; no rescoring; no updates affect tokens that have already been scored.
+
+**Compliance** (Issue #1017 Track B — legal eval-time adaptation):
+1. Causality — strictly causal sliding-window eval.
+2. Normalized distribution — standard softmax over the full 8192-token vocab, no n-gram cache, no logit biasing.
+3. Score-before-update — every token scored under `inference_mode` before any gradient update.
+4. Single pass — each token scored exactly once.
+5. No SLOT, no pre-quant TTT on val data, no eval-time logit bias (ETLB).
+
+Eval budget 600 s (sliding + TTT); actual ~500 s on all seeds.
+
+---
+
+## 3-Seed Results (PR #1493)
+
+| Seed | Sliding BPB | **TTT BPB** | Artifact bytes |
+|---|---|---|---|
+| 42  | 1.0829 | **1.0808** | 15,991,930 |
+| 314 | 1.0827 | **1.0810** | 15,992,919 |
+| 999 | 1.0826 | **1.0812** | 15,993,232 |
+| **Mean** | **1.0827** | **1.0810** | **15,992,694** |
+| **Std** | 0.0002 | 0.0002 | |
+
+Pre-TTT → post-TTT delta: ~0.002 BPB.
+
+---
+
+## What Changed from the Last-Pulled SOTA (PR #1019, 1.1147 BPB)
+
+| Change | 2026-03-25 (PR #1019) | 2026-04-09 (PR #1493) | Approx. impact |
+|--------|----|----|----|
+| Vocab | 1024 BPE | **8192 BPE** | **~−0.016 BPB** (cumulative across the window) |
+| MLP expansion | 3× | **4×** | part of the Apr 1 pivot |
+| Virtual depth | 11 | **17** (3-layer recurrence) | ~−0.005 BPB |
+| Parallel residuals | — | **Yes, from layer 7** | ~−0.002 to −0.003 BPB |
+| Optimizer | Parallel Muon + AdamW | **MuonEq-R + AdamW** | ~−0.001 BPB |
+| Weight decay | 0.04 (muon, lumped) | **0.095 muon / 0.085 embed / 0.02 adam** | compression headroom |
+| QK gain init | 1.5 | **5.25** (monotonic 1.5→4.0→5.0→5.25) | small, monotonic |
+| Quantization | Full-Hessian GPTQ, RTN on embeds | **SDClip `c=k·σ`**; GPTQ on embeds | ~−0.001 BPB + artifact headroom |
+| BigramHash, SmearGate, value-emb, QAT | Yes | **All removed** | null/negative on new stack |
+| SWA | Yes | **EMA only, 0.9965** | simplification |
+| Selective pruning | Yes (−1, 0, +1) | **Not needed** | SDClip fits natively |
+| Compression | LZMA preset=9 | **Byte-shuffle + Brotli-11 + LZMA code wrapper** | −43 KB from code wrapper |
+| TTT | Dropped | **Legal Score-First TTT** (Track B compliant) | ~−0.002 BPB |
+
+Lineage:
+
+```
+PR #1019 (1.1147)
+ └── PR #1204 (Apr 1, 1.1063) — parallel residuals + mini depth recurrence
+ └── PR #1218 (Apr 1, 1.0979) — SP4096 pivot: MLP 4×, WD 0.085, strip tricks, SDClip precursors
+       └── PR #1285 (Apr 3, 1.0912) — WD 0.090, MuonEq-R, all-int6, DR layers 4–5
+            └── PR #1334 (Apr 4, 1.0897) — + parallel residuals, QK-Gain 5.0 (still SP4096)
+       └── PR #1394 (Apr 5, 1.0856) — SP8192, GPTQ-on-embeds, SDClip, loop 4–5 twice
+            ├── PR #1412 (Apr 6, non-rec 1.0835) — Hessian-SDClip, progressive recurrence
+            ├── PR #1413 (Apr 6, 1.0828) — QK-Gain 5.0 + Legal Score-First TTT
+            └── PR #1477 (Apr 8, 1.0822) — + parallel residuals on TTT stack
+                 └── PR #1437 + PR #1445 + PR #1493 (Apr 9, 1.0810) — 3-layer recurrence, QK 5.25, WD 0.095, fractional warmdown
 ```
 
 ---
 
-## Transformer Block Detail
+## Appendix — Previous SOTA Model Card (PR #1019, 1.1147 BPB, 2026-03-25)
 
-```mermaid
-graph TD
-    subgraph Block["Transformer Block (each of 11 layers)"]
-        X[x residual] --> MIX["Residual Mix<br/>x_in = mix0 * x + mix1 * x0"]
-        X0[x0 original embed] --> MIX
+Retained here as a historical reference. This was the snapshot the user's earlier experiment folders were built on. **Do not use as a baseline for new work** — the gap to current SOTA is −0.0337 BPB.
 
-        MIX --> AN[RMSNorm × LN_scale<br/>scale = 1/√ layer+1]
+| Property | Value |
+|----------|-------|
+| Submission | AR Self-Gen GPTQ + XSA-all + BigramHash 3072×112 |
+| Score | 1.1147 BPB (3-seed mean, std 0.0004) |
+| Author | abaybektursun (PR #1019) | Date 2026-03-25 |
+| Artifact | ~15.91 MB |
+| Vocab | 1024 BPE (SentencePiece) |
+| Context | 2048 train / 2048 eval sliding stride 64 |
+| Layers | 11 U-Net (5 enc + 6 dec, with value embeddings on layers 9–10) |
+| Dim / MLP | 512 dim, 3× MLP (hidden 1536) |
+| Attention | 8 heads, 4 KV (GQA), Partial RoPE (16/64), XSA on all 11 layers |
+| Activation | LeakyReLU(0.5)² |
+| Input extras | TokEmbed + BigramHash(3072×112→512), then SmearGate(RMSNorm(·)) |
+| Optimizer | Parallel Muon + AdamW, WD=0.04 |
+| Weight averaging | EMA decay 0.997 + SWA snapshot every 50 steps |
+| Quantization | Late QAT (int6 STE at warmdown > 15 %) + Full-Hessian GPTQ int6 (AR self-gen calibration, 64×2048 temp=0.8) + selective pruning {−1, 0, +1} |
+| Compression | LZMA preset=9 |
+| Training | ~6,927 steps at 86.7 ms/step in 600 s on 8× H100 SXM |
+| Eval | Sliding window only (TTT dropped as neutral/negative on this stack) |
 
-        AN --> ATTN
-
-        subgraph ATTN["Causal Self-Attention (GQA)"]
-            direction TB
-            QKV["Q: 512→512 | K: 512→256 | V: 512→256<br/>(weights from Parameter Banks)"]
-            QKV --> QKNORM["QK RMSNorm"]
-            QKNORM --> ROPE["Partial RoPE<br/>16/64 dims rotated"]
-            ROPE --> QGAIN["Q × learnable q_gain per head"]
-            QGAIN --> FA3["Flash Attention 3<br/>(causal)"]
-            FA3 --> XSAOP["XSA: all 11 layers<br/>y = y - proj_v(y)"]
-            XSAOP --> OUTPROJ["Out projection 512 to 512"]
-        end
-
-        ATTN --> ASCALE["× attn_scale"]
-        MIX --> ARES((+))
-        ASCALE --> ARES
-
-        ARES --> MN[RMSNorm × LN_scale]
-
-        subgraph MLP_BLOCK["MLP (3x expansion)"]
-            direction TB
-            UP["Linear 512 → 1536<br/>(from mlp_up_bank)"]
-            UP --> ACT["LeakyReLU 0.5 → square<br/>leaky_relu(x, 0.5)²"]
-            ACT --> DOWN["Linear 1536 → 512<br/>(from mlp_down_bank)"]
-        end
-
-        MN --> MLP_BLOCK
-        MLP_BLOCK --> MSCALE["× mlp_scale"]
-        ARES --> MRES((+))
-        MSCALE --> MRES
-        MRES --> XOUT[x output]
-    end
-
-    style Block fill:#0a0a23,stroke:#e94560,color:#fff
-    style ATTN fill:#1a1a2e,stroke:#0f3460,color:#fff
-    style MLP_BLOCK fill:#1a1a2e,stroke:#533483,color:#fff
-```
-
----
-
-## Value Embedding Injection (Layers 9-10 only)
-
-```mermaid
-graph LR
-    TID[Token IDs] --> VE[Shared ValueEmbedding<br/>1024 → 128d → 256d]
-    VE --> SCALE["× per-layer scale"]
-    SCALE --> VADD((+ added to V<br/>before attention))
-    V_PROJ["V projection output"] --> VADD
-
-    style VE fill:#1a1a2e,stroke:#e94560,color:#fff
-```
-
----
-
-## Tokenization Pipeline
-
-```mermaid
-graph LR
-    RAW[Raw UTF-8 Text] --> SP["SentencePiece BPE<br/>vocab = 1024 tokens"]
-    SP --> IDS[Token IDs ∈ 0..1023]
-    IDS --> EMB["Token Embedding<br/>1024 × 512"]
-    IDS --> BH["BigramHash<br/>XOR hash of adjacent token pairs<br/>3072-entry table, 112d to 512d"]
-    EMB --> ADD((+))
-    BH --> ADD
-    ADD --> MODEL[Into Transformer]
-
-    style SP fill:#16213e,stroke:#0f3460,color:#fff
-```
-
----
-
-## Parameter Banks & Parallel Muon Optimizer
-
-```mermaid
-graph TD
-    subgraph Banks["4 Parameter Banks (contiguous 3D tensors)"]
-        QO["qo_bank<br/>[22, 512, 512]<br/>Q + Out for 11 layers"]
-        KV["kv_bank<br/>[22, 256, 512]<br/>K + V for 11 layers"]
-        UP["mlp_up_bank<br/>[11, 1536, 512]"]
-        DN["mlp_down_bank<br/>[11, 512, 1536]"]
-    end
-
-    subgraph Muon["Parallel Muon Optimizer Pipeline"]
-        direction TB
-        BW["backward()"] --> RS["Async Reduce-Scatter<br/>(biggest banks first)"]
-        RS --> ADAM["Meanwhile: Adam steps on<br/>small params (scales, gates, embeds)"]
-        RS --> WAIT["Wait for RS"]
-        WAIT --> NS5["Local Newton-Schulz 5-step<br/>orthogonalization on gradient shard"]
-        NS5 --> AG["Async All-Gather"]
-        AG --> APPLY["Apply update:<br/>w -= lr × scale × NS5(grad)"]
-    end
-
-    Banks --> Muon
-
-    style Banks fill:#16213e,stroke:#0f3460,color:#fff
-    style Muon fill:#1a1a2e,stroke:#533483,color:#fff
-```
-
----
-
-## Weight Averaging & Quantization
-
-```mermaid
-graph LR
-    subgraph Training
-        STEP[Training Step] --> EMA["EMA decay=0.997<br/>shadow weights"]
-        EMA --> SWA["SWA snapshot every 50 steps<br/>averaged with prior snapshots"]
-    end
-
-    subgraph Quantization
-        SWA --> LQAT["Late QAT<br/>int6 STE fake-quant<br/>kicks in at warmdown > 15%"]
-        LQAT --> SELFGEN["AR Self-Generation<br/>64 seqs x 2048 tokens<br/>temp=0.8, fixed seed"]
-        SELFGEN --> GPTQ["Full Hessian GPTQ int6<br/>Cholesky error compensation<br/>column reordering<br/>H = X^T X from self-gen data"]
-        GPTQ --> PRUNE["Selective Pruning<br/>prune values to -1, 0, +1<br/>by reconstruction error"]
-        PRUNE --> LZMA["LZMA preset=9"]
-        LZMA --> ART["Artifact ~15.91 MB"]
-    end
-
-    style Training fill:#16213e,stroke:#0f3460,color:#fff
-    style Quantization fill:#1a1a2e,stroke:#e94560,color:#fff
-```
-
-### AR Self-Generated GPTQ (key innovation)
-
-The previous SOTA used GPTQ-lite (diagonal Hessian approximation). This submission uses **Full Hessian GPTQ** — a strictly better quantizer with Cholesky error compensation and column reordering.
-
-The problem: Full Hessian GPTQ needs calibration data to compute `H = X^T X`. Prior attempts used training data, which was ruled illegal after the 600s training window.
-
-The solution: **the model generates its own calibration data**. After training completes, it autoregressively generates 64 sequences of 2048 tokens (temperature=0.8). No validation data, no training data accessed during quantization. This is fully self-contained.
-
-### TTT: Dropped
-
-The previous SOTA (PR #549) used Test-Time Training for -0.0025 BPB. On this new stack, TTT was tested 25+ times and found **neutral or negative**. The Full Hessian GPTQ improvement more than compensates.
-
----
-
-## What Changed from Previous SOTA (PR #549, 1.1194 BPB)
-
-| Change | Previous (1.1194) | Current (1.1147) | Impact |
-|--------|-------------------|-------------------|--------|
-| **Quantization** | GPTQ-lite (diagonal Hessian) | Full Hessian GPTQ with AR self-gen calibration | Major improvement |
-| **XSA** | Last 4 layers only | All 11 layers | Free quality (zero params) |
-| **BigramHash** | 1536 x 128 | 3072 x 112 | Wider table, slightly narrower dim |
-| **TTT** | Score-first TTT (-0.0025 BPB) | Dropped (neutral on this stack) | Simplifies eval |
-| **Selective pruning** | No | Yes (prune to -1, 0, +1 by reconstruction error) | Better compression |
-| **Warmdown** | 3500 iters | 4000 iters | Slightly longer cooldown |
-| **Compression** | LZMA | LZMA preset=9 | Max compression |
-
-### Lineage
-
-```
-PR #549 (1.1194) — Parallel Muon + LeakyReLU² + Legal TTT
-    └── PR #1019 (1.1147) — This work adds:
-        ├── AR self-gen Full Hessian GPTQ (no external data during quantization)
-        ├── BigramHash 3072 x 112
-        ├── XSA on all 11 layers (from PR #478)
-        ├── Selective pruning to -1, 0, +1 (from PR #609)
-        ├── Warmdown 4000, LZMA preset=9
-        └── Dropped TTT (25+ failed experiments, PR #756)
-```
+The PR #1019 recipe is superseded. Its individual pieces that survived into PR #1493: 11L × 512d × GQA(8H/4KV), Partial RoPE 16/64, LeakyReLU(0.5)², tied embeddings, logit softcap 30.0, XSA on all layers, Full-Hessian GPTQ on matrices. Everything else (BigramHash, SmearGate, VE128, QAT, SWA, selective pruning, AR self-gen calibration, parameter banking + distributed-muon boilerplate) was removed.
