@@ -547,7 +547,6 @@ class GPT(nn.Module):
     def __init__(self, h):
         super().__init__()
         if h.logit_softcap <= .0: raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
-        self.h = h  # retain for forward_logits flags
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
