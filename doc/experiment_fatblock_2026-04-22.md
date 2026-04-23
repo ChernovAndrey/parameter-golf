@@ -31,6 +31,71 @@ x_out = z + mlp_scale * mlp_out
 
 Layers 0–6 are unchanged Block instances (sequential attn→MLP). Depth recurrence on layers 3/4/5 still runs (each visited 3×). SP8192 vocab, Partial RoPE 16/64, GQA-4, LeakyReLU(0.5)², MuonEq-R, SDClip GPTQ, Brotli-11 — all inherited from PR #1493.
 
+### Encoder / decoder recurrence sequence — what the log's unsorted indices mean
+
+When you see this in the training log:
+
+```
+layer_loop:enabled step:~2200 frac:0.350
+  encoder:[0, 1, 2, 3, 4, 5, 3]
+  decoder:[4, 5, 3, 4, 5, 6, 7]
+```
+
+these are the **physical block indices visited in order** during the forward pass. The model has 8 physical blocks (7 regular Blocks at indices 0–6, plus the FatBlock at index 7). With `NUM_LOOPS=2 LOOP_START=3 LOOP_END=5`, layers 3, 4, 5 are each visited **3 times per step**; other blocks are visited once.
+
+Visits per physical block (encoder + decoder):
+
+| Block | Encoder | Decoder | Total |
+|---:|---:|---:|---:|
+| 0 | 1 | 0 | **1** |
+| 1 | 1 | 0 | **1** |
+| 2 | 1 | 0 | **1** |
+| 3 | 2 | 1 | **3** ← looped |
+| 4 | 1 | 2 | **3** ← looped |
+| 5 | 1 | 2 | **3** ← looped |
+| 6 | 0 | 1 | **1** |
+| 7 (FatBlock) | 0 | 1 | **1** |
+| | | | **14 virtual evals** |
+
+**How the sequence is built** (from `GPT.__init__`):
+
+```python
+loop_seg = [3, 4, 5]                       # layers that get looped
+all_indices = [0, 1, 2]                    # pre-loop
+for _ in range(num_loops + 1):             # 3 iterations
+    all_indices.extend([3, 4, 5])
+# all_indices == [0, 1, 2, 3, 4, 5, 3, 4, 5, 3, 4, 5]
+all_indices.extend([6, 7])                 # post-loop (last reg block + FatBlock)
+# all_indices == [0, 1, 2, 3, 4, 5, 3, 4, 5, 3, 4, 5, 6, 7]   (14 items)
+
+num_enc = 14 // 2 = 7
+encoder_indices = all_indices[:7]          # [0, 1, 2, 3, 4, 5, 3]
+decoder_indices = all_indices[7:]          # [4, 5, 3, 4, 5, 6, 7]
+```
+
+The loop straddles the encoder/decoder split on purpose — this makes the U-Net skip structure work cleanly. Encoder visits save their outputs into a `skips` list; decoder visits pop them in reverse order and add them back with learnable `skip_weights[i]` and sigmoid `skip_gates[i]`. With 7 encoder and 7 decoder positions, `num_skip_weights = 7` and each decoder position receives exactly one skip.
+
+Visually:
+
+```
+                        ENCODER (saves 7 outputs)          |          DECODER (reads 7 skips in reverse)
+visit  →  block    0    1    2    3    4    5    3        |    4    5    3    4    5    6    7
+                   ↓    ↓    ↓    ↓    ↓    ↓    ↓        |    ↓    ↓    ↓    ↓    ↓    ↓    ↓
+state             h0 → h1 → h2 → h3 → h4 → h5 → h6  (=s0..s6)     +s6  +s5  +s4  +s3  +s2  +s1  +s0
+                                                           |     (each skip-gated by sigmoid(skip_gates[i]))
+```
+
+Each `+sk` means "blend in the corresponding saved encoder output" via `x = lerp(skip, x, sigmoid(skip_gates[i]))`. That's the U-Net shortcut, preserved from SOTA.
+
+**Non-looping (warmup) version** — during the first 20 warmup steps, `looping_active=False` and the sequence is the plain range:
+
+```
+encoder: [0, 1, 2, 3]
+decoder: [4, 5, 6, 7]
+```
+
+8 virtual evals, each block visited once. The looping sequence activates when `elapsed_ms / MAX_WALLCLOCK_SECONDS ≥ ENABLE_LOOPING_AT` (default 0.35 → ~14 min into a 40-min run).
+
 ### Optional attention nonlinearity variants (apply INSIDE FatBlock only)
 
 Two independent flags that can be combined:

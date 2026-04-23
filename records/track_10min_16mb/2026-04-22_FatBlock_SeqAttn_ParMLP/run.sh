@@ -89,6 +89,10 @@ env $BASE $EXTRA torchrun --standalone --nproc_per_node=2 train_gpt.py 2>&1 | te
 
 echo "=============================================="
 echo "  DONE: $VARIANT seed=$SEED"
-echo "  Final BPB: $(grep 'quantized_sliding_window val_bpb' "$LOGFILE" | tail -1 || echo 'not found (smoke test? or failed)')"
-echo "  Artifact:  $(grep 'Total submission size' "$LOGFILE" | tail -1 || echo 'not found')"
+SLIDING_LINE=$(grep 'quantized_sliding_window' "$LOGFILE" | tail -1)
+QUANT_LINE=$(grep '^quantized val_loss' "$LOGFILE" | tail -1)
+ARTIFACT_LINE=$(grep 'Total submission size' "$LOGFILE" | tail -1)
+echo "  Sliding:   ${SLIDING_LINE:-not found (smoke test? or failed)}"
+echo "  Quantized: ${QUANT_LINE:-not found}"
+echo "  Artifact:  ${ARTIFACT_LINE:-not found}"
 echo "=============================================="
