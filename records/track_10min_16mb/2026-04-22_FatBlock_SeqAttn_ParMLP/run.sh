@@ -55,9 +55,12 @@ case "$VARIANT" in
     both)
         EXTRA="GATED_ATTN=1 GATED_ATTN_MODE=headwise GLU_V=1"
         ;;
+    both_ew)
+        EXTRA="GATED_ATTN=1 GATED_ATTN_MODE=elementwise GLU_V=1"
+        ;;
     *)
         echo "Unknown variant: $VARIANT" >&2
-        echo "Valid variants: smoke vanilla gated_hw gated_ew glu_v both" >&2
+        echo "Valid variants: smoke vanilla gated_hw gated_ew glu_v both both_ew" >&2
         exit 1
         ;;
 esac
