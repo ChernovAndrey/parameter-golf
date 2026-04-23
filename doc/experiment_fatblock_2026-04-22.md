@@ -8,20 +8,25 @@
 
 ## Architecture
 
-Replaces the 4 parallel-residual blocks (old layers 7–10) with a single **FatBlock** containing:
+Replaces the 4 parallel-residual blocks (old layers 7–10) with a single **FatBlock** containing 4 sequential attentions + 1 big MLP running in parallel:
 
-```
-   x_in (after resid_mix + optional skip aggregation)
-       │
-       ├─► attn₁ ─► + (residual) ─► attn₂ ─► + ─► attn₃ ─► + ─► attn₄ ─► + ─► z
-       │
-       └─► big_MLP(norm(x_in)) ─► mlp_out
-                  │
-       x_out = z + mlp_scale * mlp_out
+```python
+# FatBlock.forward(x_in)
+# Attention chain (each attention reads the updated hidden state)
+z = x_in
+for i in range(4):
+    z = z + attn_scales[i] * attn_i(norm(z))
+
+# Big MLP runs in parallel on x_in (not on z)
+mlp_out = big_MLP(norm(x_in))
+
+# Merge both paths
+x_out = z + mlp_scale * mlp_out
 ```
 
-- **4 sequential attention sublayers** (each refines the previous via inner residual + pre-norm). Preserves `attn_to_attn` depth, which PR #1204's learned-routing data showed is the strongest information-flow signal in deep layers.
-- **1 big shared MLP** (hidden=6144 by default, vs 2048 per-layer in original SOTA) running **in parallel** with the attention chain; it reads the fat-block input `x_in`, not the refined `z`.
+- **4 sequential attention sublayers** — each one refines the previous one's output. This preserves `attn_to_attn` depth, which PR #1204's learned-routing data showed is the strongest information-flow signal in deep layers.
+- **1 big shared MLP** (hidden=6144 by default, vs 2048 per-layer in original SOTA) running **in parallel** with the attention chain. It reads the fat-block input `x_in`, not the refined `z`, so attn and MLP are decoupled.
+- **`attn_scales`** is a learnable `[num_attns=4, dim=512]` tensor; **`mlp_scale`** is a learnable `[dim=512]` vector. Both init to all-ones. Inherited convention from the SOTA `Block`: per-feature learnable gains on attn/MLP contributions before they enter the residual stream.
 - **Depth trade**: model goes from 17 virtual evals → 14, loses 3 MLP duplications, gains one fat MLP that compresses the 4 old MLPs into one.
 
 Layers 0–6 are unchanged Block instances (sequential attn→MLP). Depth recurrence on layers 3/4/5 still runs (each visited 3×). SP8192 vocab, Partial RoPE 16/64, GQA-4, LeakyReLU(0.5)², MuonEq-R, SDClip GPTQ, Brotli-11 — all inherited from PR #1493.
@@ -109,23 +114,39 @@ This downloads pre-tokenized FineWeb into `data/datasets/fineweb10B_sp8192/` and
 
 ## Launch commands — 5 variants at SEED=42
 
-All commands assume you `cd` into this experiment folder first. `DATA_DIR=../../../data` walks back to `parameter-golf/data/`.
+**Hardware**: 2× H100. **Training time**: 40 min (`MAX_WALLCLOCK_SECONDS=2400`). **Eval runs after training** and takes ~9 min more, so expect ~50 min of pod time per variant.
+
+### Key settings
+
+- **`MAX_WALLCLOCK_SECONDS=2400`** — caps **training only** (40 min). Eval happens uncapped after the cap hits.
+- **`--nproc_per_node=2`** — use only 2 GPUs. The SOTA trainer auto-adjusts `grad_accum_steps = 8 // world_size = 4`, preserving the 786K-token effective batch.
+- **No `ITERATIONS`** needed — with wall-clock set, LR warmdown (`WARMDOWN_FRAC=0.72`) and recurrence activation (`ENABLE_LOOPING_AT=0.35`) are both driven by `elapsed_ms / MAX_WALLCLOCK_SECONDS`. The default `ITERATIONS=20000` is a safety cap far beyond what 40 min of compute reaches.
+- **`TTT_ENABLED=0`** — skip test-time training. TTT eval alone would add ~20 min on 2 H100 and isn't needed for architecture comparison.
+
+### What runs after training (not capped)
+
+~9 min total, automatic:
+- Post-training `eval_val` on the full-precision model (~40 s)
+- GPTQ Hessian collection + quantization + serialization (~40 s)
+- Dequantize + `eval_val` on the quantized model (~50 s)
+- Sliding-window eval — this is the `quantized_sliding_window val_bpb` we compare against SOTA (~550 s on 2 H100, scales ~4× from SOTA's ~130 s on 8 H100)
+
+### Commands
+
+All commands assume you `cd` into the experiment folder first. `DATA_DIR=../../../data` walks back to `parameter-golf/data/`.
 
 ```bash
 cd records/track_10min_16mb/2026-04-22_FatBlock_SeqAttn_ParMLP
 mkdir -p logs
 
 # --- Shared settings (constant across variants) ---
-# ITERATIONS=3500 lands around 30 min training on 2x H100 (leaves ~10 min for quant + sliding eval)
-# TTT_ENABLED=0 skips TTT to stay within 40 min wall clock
-# MAX_WALLCLOCK_SECONDS=2300 safety cap: abort training if we run long
+# MAX_WALLCLOCK_SECONDS=2400 → 40 min training only; eval runs after for ~9 min more
 COMMON=(
     FAT_BLOCK_ENABLED=1
     FAT_BLOCK_NUM_ATTNS=4
     FAT_BLOCK_MLP_HIDDEN=6144
-    ITERATIONS=3500
+    MAX_WALLCLOCK_SECONDS=2400
     TTT_ENABLED=0
-    MAX_WALLCLOCK_SECONDS=2300
     DATA_DIR=../../../data
 )
 
@@ -258,7 +279,7 @@ If `both > gated_hw` or `both > glu_v` → the two mechanisms interact negativel
 |---|---|
 | `train_loss` NaN early (step < 100) | Try `FAT_BLOCK_SKIP_MODE=drop` — the aggregate skip-gate may be injecting pathological values at init |
 | `Artifact > 16 MB` after GPTQ | Reduce `FAT_BLOCK_MLP_HIDDEN` to 5120 (saves ~0.5 MB); or raise `MUON_WD` to 0.10 (tighter weight distribution) |
-| FA3 kernel compile hangs first step | Normal — first step can take 30–60 s. `MAX_WALLCLOCK_SECONDS=2300` budget already accounts for it |
+| FA3 kernel compile hangs first step | Normal — first step can take 30–60 s. Not counted against `MAX_WALLCLOCK_SECONDS` (training timer starts AFTER warmup). Just wait it out. |
 | OOM on 2× H100 80GB | Lower `TRAIN_BATCH_TOKENS` to 393,216 (effective batch halved; will auto-adjust grad_accum) |
 | Step time >> 520 ms/step | Wider MLP or GLU-V may push latency up. Use `ITERATIONS=3000` instead of 3500 to ensure convergence before wall clock |
 | Recurrence never activates | Check log for `layer_loop:enabled step:N frac:0.35` — must appear by step ~1225 (35% of 3500). If missing, `ENABLE_LOOPING_AT` isn't being reached |

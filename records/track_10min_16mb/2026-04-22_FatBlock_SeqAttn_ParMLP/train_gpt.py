@@ -517,17 +517,16 @@ class FatBlock(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         # LN scale factor (uses the layer_idx of the FIRST attention in the chain for consistency)
         self.ln_scale_factor = 1. / math.sqrt(layer_idx + 1) if ln_scale else 1.
-        # Skip-aggregation gate (parameters always exist; used only when skips are passed in)
-        self.aggregated_skip_gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        # Note: with the balanced encoder/decoder index layout in GPT
+        # (min(len(enc), len(dec)) skip weights, one per decoder position),
+        # the fat block always gets a regular skip via GPT.skip_weights/skip_gates.
+        # We don't create a separate aggregated_skip_gate here — that would be
+        # a dead parameter under the current recurrence config and would trip
+        # DDP's unused-parameter check.
 
-    def forward(self, x, x0, aggregated_skip=None):
+    def forward(self, x, x0):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        # Optional aggregated-skip gate: sum the skips from encoder layers whose
-        # decoder counterparts were collapsed into the fat block.
-        if aggregated_skip is not None:
-            g = torch.sigmoid(self.aggregated_skip_gate.to(dtype=x_in.dtype))[None, None, :]
-            x_in = torch.lerp(aggregated_skip.to(dtype=x_in.dtype), x_in, g)
         # --- Attention chain: sequential refinement ---
         z = x_in
         for i in range(self.num_attns):
@@ -673,13 +672,6 @@ class GPT(nn.Module):
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.)
 
-    def _apply_block(self, block, x, x0, aggregated_skip=None):
-        """Dispatch to Block.forward or FatBlock.forward (signature differs on skip)."""
-        if isinstance(block, FatBlock):
-            return block(x, x0, aggregated_skip=aggregated_skip)
-        else:
-            return block(x, x0)
-
     def forward_logits(self, input_ids):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -695,16 +687,12 @@ class GPT(nn.Module):
             dec_iter = list(range(self.num_encoder_layers, num_physical))
         # Encoder
         for i in enc_iter:
-            x = self._apply_block(self.blocks[i], x, x0)
+            x = self.blocks[i](x, x0)
             skips.append(x)
-        # Decoder with skip connections
-        # When fat_block is ON and fat_block_skip_mode == 'aggregate', we collect any
-        # extra skips that would otherwise be dropped (skips beyond num_skip_weights
-        # pairing) and sum them into the fat block's input.
-        pending_skip_aggregate = None
-        extra_skip_count = 0
+        # Decoder with skip connections (identical logic for Block and FatBlock —
+        # both take (x, x0) and return x; FatBlock just happens to contain more
+        # sublayers internally).
         for (skip_idx, i) in enumerate(dec_iter):
-            aggregated_skip = None
             if skip_idx < self.num_skip_weights and skips:
                 scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 if self.skip_gates is not None:
@@ -712,18 +700,7 @@ class GPT(nn.Module):
                     x = torch.lerp(scaled_skip, x, g)
                 else:
                     x = x + scaled_skip
-            # If this is the fat block position and there are more skips than decoder
-            # slots, aggregate the leftovers into the fat block's input.
-            if (self.fat_block_enabled and
-                isinstance(self.blocks[i], FatBlock) and
-                self.h.fat_block_skip_mode == 'aggregate' and
-                len(skips) > 0):
-                agg = None
-                while skips:
-                    s = skips.pop()
-                    agg = s if agg is None else (agg + s)
-                aggregated_skip = agg
-            x = self._apply_block(self.blocks[i], x, x0, aggregated_skip=aggregated_skip)
+            x = self.blocks[i](x, x0)
         x = self.final_norm(x)
         if self.head_proj is not None: x = self.head_proj(x)
         if self.tie_embeddings:
@@ -800,7 +777,7 @@ class Muon(torch.optim.Optimizer):
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(pattern for pattern in os.environ.get(
     'CONTROL_TENSOR_NAME_PATTERNS',
-    'attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,aggregated_skip_gate'
+    'attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates'
 ).split(',') if pattern)
 
 
