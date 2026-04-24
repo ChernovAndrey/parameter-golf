@@ -9,7 +9,7 @@ Architecture and launch commands: `doc/experiment_fatblock_2026-04-22.md`.
 
 ---
 
-## Summary table
+## Sweep 1 — attention-variants sweep (2026-04-23, all complete)
 
 | # | Variant | Seed | train_loss (end) | pre-EMA val_bpb | quantized val_bpb | **sliding val_bpb** | Artifact (B) | Δ vs SOTA (1.0829) | Status |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
@@ -20,6 +20,49 @@ Architecture and launch commands: `doc/experiment_fatblock_2026-04-22.md`.
 | 5 | `both_ew`  | 42 | 2.8419 | 1.0895 | 1.0995 | **1.08301** | 15,820,643 | **+0.0002** ← ties gated_ew | ✅ done |
 
 **SOTA reference** (PR #1493, 8× H100, 588 s): quantized_sliding_window val_bpb = **1.0829** (3-seed mean, std 0.0002). SOTA with TTT = 1.0810.
+
+---
+
+## Sweep 2 — architectural follow-ups (implemented 2026-04-24, runs pending)
+
+Each variant is built on top of `gated_ew` (sweep-1 winner) with **one** architectural modification, scoped strictly to the fat block (regular blocks 0–6 are unchanged). Backlog and hypotheses live in `doc/experiment_fatblock_backlog.md`.
+
+| # | Variant | Change (scoped to fat block only) | Est. params | Est. artifact | **sliding val_bpb** | Δ vs gated_ew (1.08292) | Status |
+|---|---|---|---:|---:|---:|---:|---|
+| 6 | `delete_mlp_widen` | **A1**: delete big MLP + widen 4 attentions to `head_dim=96` (was 64) | 30.70 M | ~12.65 MB (est.) | — | — | 🔧 code ready, not run |
+| 7 | `mlp_sequential`   | **A2**: big MLP reads `z` (post-attn chain) instead of `x_in` (parallel) | 34.89 M | ~15.00 MB (est.) | — | — | 🔧 code ready, not run |
+| 8 | `leaky_attn`       | **A3**: `leaky_relu(y, 0.5).square()` on SDPA output, before gate+proj, in the 4 fat-block attentions | 34.89 M | ~15.00 MB (est.) | — | — | 🔧 code ready, not run |
+
+**Code status (verified by CPU smoke test + bug audit)**:
+- All 3 variants instantiate on CPU with correct param counts (verified: `delete_mlp_widen=30.70M`, `mlp_sequential=34.89M`, `leaky_attn=34.89M`)
+- Forward + backward passes cleanly under both `looping_active=False` (warmup) and `looping_active=True` (main training)
+- Every parameter receives a gradient (no DDP unused-parameter risk)
+- Regular Blocks (layers 0–6) confirmed unchanged for all three variants (`head_dim=64`, `attn_output_activation='none'`, standard attn→MLP logic)
+
+**Flags / run command**:
+```bash
+./run.sh delete_mlp_widen     # A1
+./run.sh mlp_sequential       # A2
+./run.sh leaky_attn           # A3
+```
+
+Under the hood, each sets env vars on top of `gated_ew`'s base (`GATED_ATTN=1 GATED_ATTN_MODE=elementwise GLU_V=0`):
+
+| Variant | Extra env vars |
+|---|---|
+| `delete_mlp_widen` | `FAT_BLOCK_MLP_ENABLED=0 FAT_ATTN_HEAD_DIM=96` |
+| `mlp_sequential` | `FAT_BLOCK_MLP_MODE=sequential` |
+| `leaky_attn` | `ATTN_OUTPUT_ACTIVATION=leaky_relu_sq` |
+
+**Expected range per variant (from backlog):**
+
+| Variant | Optimistic | Central | Pessimistic |
+|---|---:|---:|---:|
+| `delete_mlp_widen` | 1.0800 | 1.0830 | 1.0870 (if MLP is truly essential) |
+| `mlp_sequential` | 1.0820 | 1.0830 | 1.0850 |
+| `leaky_attn` | 1.0826 | 1.0830 | 1.0832 |
+
+Any variant landing ≤ 1.0820 at single seed would be a clear sub-SOTA result. Combined with TTT (`TTT_ENABLED=1`), the winner is expected to further drop ~0.002 BPB, potentially beating SOTA's headline 1.0810.
 
 ---
 

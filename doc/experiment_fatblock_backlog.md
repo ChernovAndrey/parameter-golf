@@ -214,20 +214,30 @@ If A1 fails (net regression):
 
 Update this section as experiments complete.
 
-| Idea | Status | Result |
-|---|---|---|
-| A1 | pending | — |
-| A2 | pending | — |
-| A3 | pending | — |
-| B1 | deferred | — |
-| B2 | pending (after winner) | — |
-| B3 | deferred | — |
-| B4 | deferred | — |
-| B5 | deferred | — |
-| B6 | deferred | — |
-| B7 | deferred (infeasible) | — |
-| B8 | deferred (kernel cost) | — |
-| B9 | deferred | — |
+| Idea | Status | Variant name | Result |
+|---|---|---|---|
+| A1 | 🔧 code ready (2026-04-24), run pending | `delete_mlp_widen` | — |
+| A2 | 🔧 code ready (2026-04-24), run pending | `mlp_sequential`   | — |
+| A3 | 🔧 code ready (2026-04-24), run pending | `leaky_attn` — scoped to fat block only | — |
+| B1 | deferred (user preferred radical changes first) | — | — |
+| B2 | pending (after A-tier winner)                  | — (would set `TTT_ENABLED=1` on winner) | — |
+| B3 | deferred                                       | — | — |
+| B4 | deferred                                       | — | — |
+| B5 | deferred                                       | — | — |
+| B6 | deferred                                       | — | — |
+| B7 | deferred (infeasible — kernel cost)            | — | — |
+| B8 | deferred (kernel cost)                         | — | — |
+| B9 | deferred                                       | — | — |
+
+**Implementation notes (2026-04-24)**:
+- A1/A2/A3 code added to `train_gpt.py` via four new hyperparameters:
+  - `FAT_ATTN_HEAD_DIM` — overrides head_dim for fat-block attentions only (A1)
+  - `FAT_BLOCK_MLP_ENABLED` — toggles the big MLP in the fat block (A1)
+  - `FAT_BLOCK_MLP_MODE` — `parallel`/`sequential` toggles where the big MLP reads from (A2)
+  - `ATTN_OUTPUT_ACTIVATION` — applied only inside fat-block attentions; `none` / `leaky_relu_sq` (A3)
+- **Regular Blocks (layers 0–6) are NOT modified** by any A-tier flag. Only the fat block (layer 7) sees A1/A2/A3 effects. This is a clean ablation against `gated_ew`.
+- CPU smoke tests + a bug audit covering 8 edge cases (RoPE with widened head_dim, gate shape mismatch, GLU-V + widening combo, DDP unused-parameter safety, optimizer routing, encoder/decoder indices, invalid value handling, missing MLP attributes) all pass.
+- Launcher `run.sh` has three new variants: `delete_mlp_widen`, `mlp_sequential`, `leaky_attn`.
 
 ---
 

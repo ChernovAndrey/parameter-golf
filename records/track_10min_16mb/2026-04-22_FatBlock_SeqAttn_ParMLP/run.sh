@@ -85,7 +85,8 @@ case "$VARIANT" in
         ;;
     leaky_attn)
         # A3: apply leaky_relu(y, 0.5).square() on SDPA output, before gate+proj,
-        # in EVERY attention (all 11 blocks). Zero param change.
+        # inside the FAT BLOCK's 4 attentions ONLY (regular blocks 0-6 unchanged —
+        # they already have MLP-supplied per-token nonlinearity). Zero param change.
         EXTRA="$GATED_EW_BASE ATTN_OUTPUT_ACTIVATION=leaky_relu_sq"
         ;;
     *)

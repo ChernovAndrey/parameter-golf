@@ -495,12 +495,16 @@ class MLP(nn.Module):
 # Block — unchanged (handles sequential & parallel residual modes)
 # ======================================================================
 class Block(nn.Module):
+    # NOTE: The A3 `ATTN_OUTPUT_ACTIVATION` flag is intentionally NOT forwarded here —
+    # it applies to the FatBlock's attentions only (see FatBlock.__init__). Regular
+    # blocks (layers 0-6) already have an MLP after their attention providing
+    # per-token nonlinearity, so the activation would be redundant there and it
+    # would also confound the architectural ablation against gated_ew.
     def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                 train_seq_len, layer_idx=0, ln_scale=False, attn_output_activation='none'):
+                 train_seq_len, layer_idx=0, ln_scale=False):
         super().__init__()
         self.attn_norm = RMSNorm(); self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len,
-                                        attn_output_activation=attn_output_activation)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len)
         self.mlp = MLP(dim, mlp_mult=mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -638,8 +642,7 @@ class GPT(nn.Module):
             blocks = [
                 Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
                       h.rope_base, h.qk_gain_init, h.train_seq_len,
-                      layer_idx=i, ln_scale=h.ln_scale,
-                      attn_output_activation=h.attn_output_activation)
+                      layer_idx=i, ln_scale=h.ln_scale)
                 for i in range(regular_block_count)
             ]
             gated_mode = h.gated_attn_mode if h.gated_attn_enabled else None
@@ -668,8 +671,7 @@ class GPT(nn.Module):
             self.blocks = nn.ModuleList([
                 Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
                       h.rope_base, h.qk_gain_init, h.train_seq_len,
-                      layer_idx=i, ln_scale=h.ln_scale,
-                      attn_output_activation=h.attn_output_activation)
+                      layer_idx=i, ln_scale=h.ln_scale)
                 for i in range(h.num_layers)
             ])
             self.fat_block_idx = None
