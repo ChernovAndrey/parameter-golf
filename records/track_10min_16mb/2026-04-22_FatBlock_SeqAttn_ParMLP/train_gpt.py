@@ -128,6 +128,30 @@ class Hyperparameters:
     glu_v_enabled = bool(int(os.environ.get('GLU_V', '0')))
 
     # ------------------------------------------------------------------
+    # Architectural explorations (A1 / A2 / A3 in the backlog)
+    # ------------------------------------------------------------------
+    # A1 — widen the attentions inside the fat block. When > 0, overrides
+    # head_dim JUST for FatBlock's attentions (regular blocks 0..6 stay at
+    # model_dim // num_heads = 64). E.g. FAT_ATTN_HEAD_DIM=96 makes each of
+    # the fat block's 4 attentions internally 8 heads x 96 dim = 768 attn_dim
+    # before projecting back to model_dim=512. If 0 (default), use the
+    # standard head_dim = model_dim / num_heads.
+    fat_attn_head_dim = int(os.environ.get('FAT_ATTN_HEAD_DIM', '0'))
+    # A1 — toggle whether the fat block has its big MLP at all. When 0, the
+    # fat block is 4 attentions with no MLP; the residual-stream MLP work
+    # is carried entirely by the (wider) attentions.
+    fat_block_mlp_enabled = bool(int(os.environ.get('FAT_BLOCK_MLP_ENABLED', '1')))
+    # A2 — change where the big MLP reads from. 'parallel' (default) reads
+    # the fat-block input x_in (GPT-J style). 'sequential' reads the
+    # post-attention-chain state z (standard transformer style).
+    fat_block_mlp_mode = os.environ.get('FAT_BLOCK_MLP_MODE', 'parallel')
+    # A3 — optional per-token nonlinearity applied to the SDPA output,
+    # before the optional gate and the output projection.
+    #   'none'          (default)  — no activation
+    #   'leaky_relu_sq' — y = leaky_relu(y, 0.5).square()  (matches MLP style)
+    attn_output_activation = os.environ.get('ATTN_OUTPUT_ACTIVATION', 'none')
+
+    # ------------------------------------------------------------------
     # Distributed / derived settings (unchanged from PR #1493)
     # ------------------------------------------------------------------
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -334,47 +358,75 @@ class CausalSelfAttention(nn.Module):
           y = y * gate
           y = W_o @ y
         'headwise':    W_g: [dim -> num_heads]    (broadcast gate over head_dim)
-        'elementwise': W_g: [dim -> dim]          (per-feature gate, ~60x more params)
+        'elementwise': W_g: [dim -> attn_dim]     (per-feature gate, ~60x more params)
 
       glu_v: bool
         Replaces V projection with SwiGLU-style gated value:
           V = silu(W_v1 @ x) * (W_v2 @ x)
         FA3 receives the gated V. Compatible with GQA.
+
+      head_dim: int | None
+        Override the default head_dim = dim / num_heads. When provided, the
+        attention operates internally at num_heads * head_dim (the "attn_dim"),
+        with Q projecting dim -> attn_dim, K/V projecting dim -> kv_dim, and
+        the output projection going attn_dim -> dim to match the residual
+        stream. Used to widen attention capacity in the fat block without
+        changing the model_dim of the residual stream.
+
+      attn_output_activation in {'none', 'leaky_relu_sq'}:
+        Optional per-token nonlinearity on SDPA output, applied BEFORE the
+        gate and output projection. 'leaky_relu_sq' matches the MLP activation
+        style (`leaky_relu(y, 0.5).square()`).
     """
     def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len,
-                 gated_mode=None, glu_v=False):
+                 gated_mode=None, glu_v=False,
+                 head_dim=None, attn_output_activation='none'):
         super().__init__()
-        if dim % num_heads != 0: raise ValueError('model_dim must be divisible by num_heads')
         if num_heads % num_kv_heads != 0: raise ValueError('num_heads must be divisible by num_kv_heads')
-        self.num_heads = num_heads; self.num_kv_heads = num_kv_heads; self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0: raise ValueError('head_dim must be even for RoPE')
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
+        # Resolve head_dim (defaults to dim / num_heads, i.e. attn_dim == dim).
+        if head_dim is None or head_dim <= 0:
+            if dim % num_heads != 0: raise ValueError('model_dim must be divisible by num_heads when head_dim is not provided')
+            head_dim = dim // num_heads
+        if head_dim % 2 != 0: raise ValueError('head_dim must be even for RoPE')
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.attn_dim = num_heads * head_dim           # internal attention dim (pre-proj)
+        kv_dim = num_kv_heads * head_dim
+        # Q projects into the internal attention dim; K/V into the grouped-kv dim.
+        self.c_q = CastedLinear(dim, self.attn_dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.glu_v = glu_v
         if glu_v:
-            # Two V projections for SwiGLU-style gated value
             self.c_v1 = CastedLinear(dim, kv_dim, bias=False)
             self.c_v2 = CastedLinear(dim, kv_dim, bias=False)
             self.c_v = None
         else:
             self.c_v = CastedLinear(dim, kv_dim, bias=False)
             self.c_v1 = self.c_v2 = None
-        self.proj = CastedLinear(dim, dim, bias=False)
+        # Output projection always brings the attention output back to the residual-stream dim.
+        self.proj = CastedLinear(self.attn_dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
         self.use_xsa = False
 
-        # Qwen G1 gated attention
-        self.gated_mode = gated_mode  # None | 'headwise' | 'elementwise'
+        # Qwen G1 gated attention. Gate is applied on the SDPA output (pre-proj),
+        # which has shape [B, T, attn_dim]. For 'elementwise' mode the gate
+        # projection must therefore map `dim -> attn_dim` (not `dim -> dim`).
+        self.gated_mode = gated_mode
         if gated_mode == 'headwise':
             self.c_g = CastedLinear(dim, num_heads, bias=False)
         elif gated_mode == 'elementwise':
-            self.c_g = CastedLinear(dim, dim, bias=False)
+            self.c_g = CastedLinear(dim, self.attn_dim, bias=False)
         else:
             self.c_g = None
+
+        # A3: optional per-token activation on SDPA output (before gate + proj).
+        if attn_output_activation not in ('none', 'leaky_relu_sq'):
+            raise ValueError(f"Unknown attn_output_activation: {attn_output_activation!r}")
+        self.attn_output_activation = attn_output_activation
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape; Hkv = v.size(-2); group = H // Hkv
@@ -384,7 +436,7 @@ class CausalSelfAttention(nn.Module):
         return (y_g - proj).reshape(B, T, H, D)
 
     def forward(self, x):
-        bsz, seqlen, dim = x.shape
+        bsz, seqlen, _ = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         # V (optionally GLU'd)
@@ -405,18 +457,21 @@ class CausalSelfAttention(nn.Module):
         # SDPA via FA3
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa: y = self._xsa_efficient(y, v)
+        # A3: optional per-token activation on SDPA output (before gate + proj)
+        if self.attn_output_activation == 'leaky_relu_sq':
+            y = F.leaky_relu(y, negative_slope=0.5).square()
         # Qwen G1 gated attention: sigmoid gate on SDPA output, BEFORE W_o
         if self.gated_mode == 'headwise':
             # gate shape: [B, T, num_heads], broadcast over head_dim
             gate = torch.sigmoid(self.c_g(x)).to(dtype=y.dtype)
             y = y * gate.unsqueeze(-1)
         elif self.gated_mode == 'elementwise':
-            # gate shape: [B, T, dim] = [B, T, num_heads*head_dim]
+            # gate shape: [B, T, attn_dim]
             gate = torch.sigmoid(self.c_g(x)).to(dtype=y.dtype)
-            y = y.reshape(bsz, seqlen, dim) * gate
+            y = y.reshape(bsz, seqlen, self.attn_dim) * gate
             y = y.reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        # Output projection
-        y = y.reshape(bsz, seqlen, dim)
+        # Output projection (attn_dim -> model_dim)
+        y = y.reshape(bsz, seqlen, self.attn_dim)
         return self.proj(y)
 
 
@@ -441,10 +496,11 @@ class MLP(nn.Module):
 # ======================================================================
 class Block(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                 train_seq_len, layer_idx=0, ln_scale=False):
+                 train_seq_len, layer_idx=0, ln_scale=False, attn_output_activation='none'):
         super().__init__()
         self.attn_norm = RMSNorm(); self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len,
+                                        attn_output_activation=attn_output_activation)
         self.mlp = MLP(dim, mlp_mult=mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -496,23 +552,34 @@ class FatBlock(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                  train_seq_len, layer_idx=0, ln_scale=False,
                  num_attns=4, mlp_hidden=6144,
-                 gated_mode=None, glu_v=False):
+                 gated_mode=None, glu_v=False,
+                 fat_head_dim=None,          # A1: override head_dim for attentions in this block
+                 mlp_enabled=True,           # A1: toggle the big MLP entirely
+                 mlp_mode='parallel',        # A2: 'parallel' (reads x_in) or 'sequential' (reads z)
+                 attn_output_activation='none'):  # A3: forwarded to CausalSelfAttention
         super().__init__()
+        if mlp_mode not in ('parallel', 'sequential'):
+            raise ValueError(f"fat_block mlp_mode must be 'parallel' or 'sequential', got {mlp_mode!r}")
         self.num_attns = num_attns
-        # One pre-norm per attention in the chain + one pre-norm for the MLP path
+        self.mlp_enabled = bool(mlp_enabled)
+        self.mlp_mode = mlp_mode
+        # One pre-norm per attention in the chain
         self.attn_norms = nn.ModuleList([RMSNorm() for _ in range(num_attns)])
-        self.mlp_norm = RMSNorm()
-        # num_attns sequential attentions, each optionally with gated/GLU-V variants
+        # num_attns sequential attentions, each optionally widened/gated/GLU-V'd/activated
         self.attns = nn.ModuleList([
             CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len,
-                                gated_mode=gated_mode, glu_v=glu_v)
+                                gated_mode=gated_mode, glu_v=glu_v,
+                                head_dim=fat_head_dim,
+                                attn_output_activation=attn_output_activation)
             for _ in range(num_attns)
         ])
-        # One big MLP (not mlp_mult: explicit hidden size to control artifact budget)
-        self.mlp = MLP(dim, hidden=mlp_hidden)
-        # Per-sublayer attention residual scale + single MLP scale
+        # Optional big MLP path. When disabled, the fat block is attentions-only.
+        if self.mlp_enabled:
+            self.mlp_norm = RMSNorm()
+            self.mlp = MLP(dim, hidden=mlp_hidden)
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # Per-sublayer attention residual scales
         self.attn_scales = nn.Parameter(torch.ones(num_attns, dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         # Residual mix (same convention as Block): blend with x0 (initial embedding)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         # LN scale factor (uses the layer_idx of the FIRST attention in the chain for consistency)
@@ -533,11 +600,15 @@ class FatBlock(nn.Module):
             a = self.attns[i](self.attn_norms[i](z) * self.ln_scale_factor)
             scale_i = self.attn_scales[i].to(dtype=z.dtype)[None, None, :]
             z = z + scale_i * a
-        # --- MLP path: parallel with attention chain, reads x_in not z ---
-        mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
-        # --- Merge ---
-        x_out = z + self.mlp_scale.to(dtype=z.dtype)[None, None, :] * mlp_out
-        return x_out
+        # --- Optional big MLP path ---
+        if self.mlp_enabled:
+            # A2: 'parallel' reads fat-block input x_in (GPT-J style),
+            #     'sequential' reads post-attention-chain state z (standard transformer).
+            mlp_input = z if self.mlp_mode == 'sequential' else x_in
+            mlp_out = self.mlp(self.mlp_norm(mlp_input) * self.ln_scale_factor)
+            return z + self.mlp_scale.to(dtype=z.dtype)[None, None, :] * mlp_out
+        # Attentions-only fat block: residual stream goes through just the attn chain.
+        return z
 
 
 # ======================================================================
@@ -567,10 +638,13 @@ class GPT(nn.Module):
             blocks = [
                 Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
                       h.rope_base, h.qk_gain_init, h.train_seq_len,
-                      layer_idx=i, ln_scale=h.ln_scale)
+                      layer_idx=i, ln_scale=h.ln_scale,
+                      attn_output_activation=h.attn_output_activation)
                 for i in range(regular_block_count)
             ]
             gated_mode = h.gated_attn_mode if h.gated_attn_enabled else None
+            # FAT_ATTN_HEAD_DIM=0 means "use default head_dim" (same as model_dim / num_heads)
+            fat_head_dim = h.fat_attn_head_dim if h.fat_attn_head_dim > 0 else None
             fat = FatBlock(
                 h.model_dim, h.num_heads, h.num_kv_heads,
                 h.rope_base, h.qk_gain_init, h.train_seq_len,
@@ -579,6 +653,10 @@ class GPT(nn.Module):
                 mlp_hidden=h.fat_block_mlp_hidden,
                 gated_mode=gated_mode,
                 glu_v=h.glu_v_enabled,
+                fat_head_dim=fat_head_dim,
+                mlp_enabled=h.fat_block_mlp_enabled,
+                mlp_mode=h.fat_block_mlp_mode,
+                attn_output_activation=h.attn_output_activation,
             )
             blocks.append(fat)
             self.blocks = nn.ModuleList(blocks)
@@ -590,7 +668,8 @@ class GPT(nn.Module):
             self.blocks = nn.ModuleList([
                 Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
                       h.rope_base, h.qk_gain_init, h.train_seq_len,
-                      layer_idx=i, ln_scale=h.ln_scale)
+                      layer_idx=i, ln_scale=h.ln_scale,
+                      attn_output_activation=h.attn_output_activation)
                 for i in range(h.num_layers)
             ])
             self.fat_block_idx = None
@@ -600,16 +679,18 @@ class GPT(nn.Module):
         self.num_decoder_layers = effective_num_layers - self.num_encoder_layers
 
         if h.rope_dims > 0:
-            head_dim = h.model_dim // h.num_heads
+            # Use each attention's own head_dim when rebuilding the Rotary cache.
+            # FatBlock attentions may have been widened via FAT_ATTN_HEAD_DIM (A1),
+            # so hard-coding `h.model_dim // h.num_heads` would mis-size the
+            # rotary frequencies for those attentions.
             for block in self.blocks:
-                # Patch RoPE dims on all attentions (Block has one .attn; FatBlock has .attns list)
                 if isinstance(block, FatBlock):
                     for a in block.attns:
                         a.rope_dims = h.rope_dims
-                        a.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                        a.rotary = Rotary(a.head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
                 else:
                     block.attn.rope_dims = h.rope_dims
-                    block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                    block.attn.rotary = Rotary(block.attn.head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
 
         self.final_norm = RMSNorm()
         self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
