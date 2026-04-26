@@ -29,9 +29,9 @@ Each variant is built on top of `gated_ew` (sweep-1 winner) with **one** archite
 
 | # | Variant | Change (scoped to fat block only) | Est. params | Est. artifact | **sliding val_bpb** | Δ vs gated_ew (1.08292) | Status |
 |---|---|---|---:|---:|---:|---:|---|
-| 6 | `delete_mlp_widen` | **A1**: delete big MLP + widen 4 attentions to `head_dim=96` (was 64) | 30.70 M | ~12.65 MB (est.) | — | — | 🔧 code ready, not run |
-| 7 | `mlp_sequential`   | **A2**: big MLP reads `z` (post-attn chain) instead of `x_in` (parallel) | 34.89 M | ~15.00 MB (est.) | — | — | 🔧 code ready, not run |
-| 8 | `leaky_attn`       | **A3**: `leaky_relu(y, 0.5).square()` on SDPA output, before gate+proj, in the 4 fat-block attentions | 34.89 M | ~15.00 MB (est.) | — | — | 🔧 code ready, not run |
+| 6 | `delete_mlp_widen` | **A1**: delete big MLP + widen 4 attentions to `head_dim=96` (was 64) | 30.70 M | ~12.65 MB (est.) | ~1.100 (proj. — quant step crashed) | **+0.017 (proj.)** | ❌ abandoned — pre-quant val_bpb +0.021 vs gated_ew, not a winner |
+| 7 | `mlp_sequential`   | **A2**: big MLP reads `z` (post-attn chain) instead of `x_in` (parallel) | 34.89 M | ~15.00 MB (est.) | **1.08576** | **+0.00284** | ❌ done — worse than vanilla, worse than backlog pessimistic |
+| 8 | `leaky_attn`       | **A3**: `leaky_relu(y, 0.5).square()` on SDPA output, before gate+proj, in the 4 fat-block attentions | 34.89 M | 15.60 MB | **1.08732** | **+0.00440** | ❌ done — worst Sweep-2 variant on real numbers; nonlinearity hurt rather than helped |
 
 **Code status (verified by CPU smoke test + bug audit)**:
 - All 3 variants instantiate on CPU with correct param counts (verified: `delete_mlp_widen=30.70M`, `mlp_sequential=34.89M`, `leaky_attn=34.89M`)
@@ -411,6 +411,213 @@ Headline findings:
 
 ---
 
+## Sweep 2 — Variant 1 — `delete_mlp_widen` (A1, seed 42, 2026-04-26) — abandoned
+
+**Config**: `GATED_ATTN=1 GATED_ATTN_MODE=elementwise GLU_V=0 FAT_BLOCK_MLP_ENABLED=0 FAT_ATTN_HEAD_DIM=96 MAX_WALLCLOCK_SECONDS=2400 TTT_ENABLED=0 SEED=42`.
+**Log**: `records/track_10min_16mb/2026-04-22_FatBlock_SeqAttn_ParMLP/logs/delete_mlp_widen_s42.log`.
+**Model params**: 30,695,512 (30.70 M) — 12 % smaller than gated_ew (34.89 M), as designed.
+**Peak GPU memory**: 37,297 MiB / 80 GB.
+**End step**: 4865 (wallclock cap, 2388 s training).
+
+### Why abandoned
+
+Post-training compression crashed with `ModuleNotFoundError: No module named 'brotli'` on a fresh pod that didn't have brotli installed. Training itself completed and produced a valid `final_model.pt`, but `run_sweep2.sh` cleared it before the next variant started. We did **not** re-run because the pre-quant numbers already showed A1 is not a winner — see below.
+
+(Fix landed: `run_sweep2.sh` now runs `python3 -c "import brotli" || pip install -q brotli` at startup.)
+
+### Training trajectory vs SOTA and gated_ew
+
+| Step | SOTA | gated_ew (winner, 34.89M) | **delete_mlp_widen (30.70M)** | Δ vs gated_ew |
+|---:|---:|---:|---:|---:|
+| 500  | 3.3346 | 3.3206 | 3.3577 | +0.037 |
+| 1000 | 3.1948 | 3.1847 | 3.2343 | +0.050 |
+| 1500 | 3.1030 | 3.1573 | 3.2060 | +0.049 |
+| 2000 | 3.0686 | 3.1481 | 3.1934 | +0.045 |
+| *layer_loop activated* | step 2018 | step 2183 | **step 2173** | — |
+| 2500 | 3.0673 | 3.0644 | 3.1169 | +0.053 |
+| 3000 | 2.9476 | 3.0225 | 3.0722 | +0.050 |
+| 3500 | 2.9672 | 2.9493 | 2.9989 | +0.050 |
+| 4000 | 2.9106 | 2.8605 | 2.9109 | +0.050 |
+| 4000 val_bpb | 1.1119 | **1.1255** | **1.1451** | **+0.0196** |
+| 4500 | 2.7622 | 2.8494 | 2.8987 | +0.049 |
+| end (val_bpb) | 1.0886 step 4550 | 1.0883 step 4895 | **1.10915 step 4865 (post-EMA pre-quant)** | **+0.0208** |
+
+**Throughput**: 0.384 s/step pre-recurrence, 0.576 s/step post-recurrence. Despite the smaller model, post-loop step time is **20 % slower** than vanilla's 0.48 s/step — the head_dim=96 widening (× 4 fat attentions × 2 recurrence iterations) more than ate the savings from deleting the MLP.
+
+### Final evaluation numbers (partial — quant step crashed)
+
+| Metric | gated_ew (winner) | vanilla | **delete_mlp_widen** | Δ vs gated_ew |
+|---|---:|---:|---:|---:|
+| End step | 4895 | 4969 | 4865 | — |
+| Final train_loss | 2.8494 | 2.8600 | ~2.86 (extrapolated) | ≈ similar |
+| Pre-EMA pre-quant val_bpb | 1.0883 | 1.0904 | **1.10915** | **+0.0208** |
+| Quantized val_bpb | 1.0996 | 1.1017 | *(crashed, no number)* | — |
+| **Sliding val_bpb** | **1.08292** | 1.08493 | **~1.100 (projected)** | **+0.017 (projected)** |
+
+**Projection method**: gated_ew lost 0.0113 BPB to quantization and gained 0.0167 from sliding-window eval (1.0883 → 1.0996 → 1.08292). delete_mlp_widen's smaller artifact (~12.65 MB est. vs gated_ew's 15.60 MB) might cut the quant penalty to ~0.006, leaving sliding ≈ 1.10915 + 0.006 − 0.017 = **~1.098–1.100**. That's well above gated_ew's 1.08292 — clear loss.
+
+### Interpretation — why A1 fails
+
+1. **Train_loss tracks gated_ew at a stable +0.05 throughout.** That's the param-count tax (12 % fewer params); architecture is training cleanly.
+
+2. **But val_bpb is +0.020 behind gated_ew at every checkpoint** — a much wider gap than train_loss predicts. Generalization, not optimization, is the problem.
+
+3. **Hypothesis (consistent with Sweep-1 vanilla post-mortem)**: the fat block's stacked attentions have no per-token nonlinearity between them — the parallel MLP was supplying that. Deleting the MLP and reinvesting into wider attentions just adds more linear-then-softmax-then-linear capacity without the elementwise nonlinearity needed to break feature collinearity in the residual stream. Larger param count would not help; you'd need to put the parameters into something like an inter-attention MLP, GLU, or activation function.
+
+4. **Smaller artifact does not save the variant.** Even a generous quant-savings assumption (cut from 0.011 to 0.006 BPB) leaves A1 ~+0.017 above gated_ew. The pre-quant generalization gap is too large to close with compression alone.
+
+5. **Step-time penalty.** Widening head_dim 64→96 adds ~50 % FLOPs per fat attention, amplified by recurrence. This was meant to be a free side-effect of repurposing the freed MLP budget, but it actually makes the variant the **slowest of all five** by step time. If A1 had won on BPB, this would still cost ~75 fewer training steps in the same wallclock — not catastrophic, but unwelcome.
+
+### Takeaway for A2 / A3
+
+A1's failure mode is **loss of per-token nonlinearity in the fat block**. Both remaining variants keep the MLP and add nonlinearity in different places:
+
+- **A2 (`mlp_sequential`)** — MLP reads `z` (post-attn-chain output) instead of `x_in`. Same params, different routing. Doesn't fix the inter-attention collinearity issue (still no nonlinearity *between* attentions), but lets the MLP refine attention output instead of competing with it. Expected to be modest at best.
+- **A3 (`leaky_attn`)** — `leaky_relu(y, 0.5)²` on each fat-attention SDPA output, before gate+proj. **This directly addresses A1's failure mode**: per-attention nonlinearity inside the chain. A3 is now the most interesting bet of Sweep 2.
+
+---
+
+## Sweep 2 — Variant 2 — `mlp_sequential` (A2, seed 42, 2026-04-26)
+
+**Config**: `GATED_ATTN=1 GATED_ATTN_MODE=elementwise GLU_V=0 FAT_BLOCK_MLP_MODE=sequential MAX_WALLCLOCK_SECONDS=2400 TTT_ENABLED=0 SEED=42`.
+**Log**: `records/track_10min_16mb/2026-04-22_FatBlock_SeqAttn_ParMLP/logs/mlp_sequential_s42.log`.
+**Model params**: 34,890,328 (34.89 M) — identical to gated_ew, only the MLP routing changed.
+**Peak GPU memory**: 38,337 MiB / 80 GB.
+**End step**: 4877 (wallclock cap, 2389 s training).
+**Artifact**: 15,603,261 bytes (essentially tied with gated_ew's 15,600,043).
+
+### Training trajectory vs gated_ew
+
+| Step | gated_ew (winner) | vanilla | **mlp_sequential (A2)** | Δ vs gated_ew | Δ vs vanilla |
+|---:|---:|---:|---:|---:|---:|
+| 500  | 3.3206 | 3.3175 | 3.3195 | −0.001 | +0.002 |
+| 1000 | 3.1847 | 3.1860 | 3.1877 | +0.003 | +0.002 |
+| 1500 | 3.1573 | 3.1623 | 3.1653 | +0.008 | +0.003 |
+| 2000 | 3.1481 | 3.1474 | 3.1522 | +0.004 | +0.005 |
+| *layer_loop activated* | step 2183 | step 2231 | **step 2178** | — | — |
+| 2500 | 3.0644 | 3.0753 | 3.0719 | +0.008 | −0.003 |
+| 3000 | 3.0225 | 3.0279 | 3.0255 | +0.003 | −0.002 |
+| 3500 | 2.9493 | 2.9560 | 2.9565 | +0.007 | +0.001 |
+| 4000 | 2.8605 | 2.8718 | 2.8676 | **+0.007** | **−0.004** |
+| 4000 val_bpb | **1.1255** | 1.1295 | **1.1281** | +0.0026 | −0.0014 |
+| 4500 | 2.8494 | 2.8600 | 2.8569 | +0.008 | −0.003 |
+| end (val_bpb) | 1.0883 | 1.0904 | **1.09120** (post-EMA pre-quant) | **+0.0029** | +0.0008 |
+
+**Throughput**: 0.384 s/step pre-recurrence, ~0.576 s/step post-recurrence — same as A1 within noise. Despite identical param count to gated_ew, sequential MLP routing doesn't change FLOP count meaningfully.
+
+### Final evaluation numbers
+
+| Metric | gated_ew (winner) | vanilla | **mlp_sequential (A2)** | Δ vs gated_ew |
+|---|---:|---:|---:|---:|
+| End step | 4895 | 4969 | 4877 | — |
+| Final train_loss (step 4500) | 2.8494 | 2.8600 | 2.8569 | +0.008 |
+| Pre-EMA pre-quant val_bpb | 1.0883 | 1.0904 | **1.09120** | **+0.0029** |
+| Quantized val_bpb | 1.0996 | 1.1017 | **1.10235** | +0.0027 |
+| **Sliding val_bpb** | **1.08292** | 1.08493 | **1.08576** | **+0.00284** |
+| Artifact (bytes) | 15,600,043 | 15,153,396 | 15,603,261 | +3,218 |
+| Backlog estimate range | — | — | [1.0820 / 1.0830 / 1.0850] | actual is **outside pessimistic** |
+
+### Interpretation — A2 is worse than vanilla
+
+1. **A2 < vanilla (+0.00083 sliding val_bpb).** Vanilla landed at 1.08493; A2 at 1.08576. Switching the MLP from parallel (reads `x_in`) to sequential (reads `z` = attn-chain output) **regresses** vs the simpler baseline. The hypothesis was "the MLP refines the attn output instead of competing with it" — the data refutes that framing. It looks more like the parallel MLP and the attn chain do **complementary** work on `x_in`, and forcing serialization throws away that complementarity.
+
+2. **Trains nearly as well as gated_ew, generalizes worse — same pattern as A1.** At step 4000, A2 train_loss is 2.8676 (gated_ew 2.8605, +0.007), val_bpb is 1.1281 (gated_ew 1.1255, +0.0026). The optimization is fine; generalization is the bottleneck. This is now a consistent fat-block-specific signal across vanilla, A1, and A2: **anything that reduces the per-token MLP signal degrades val faster than it degrades train**.
+
+3. **Outside backlog's pessimistic range.** Backlog said worst-case 1.0850; actual is 1.08576. The intuition that A2 was a "modest at best" but stable rearrangement was wrong — it's strictly worse than parallel.
+
+4. **A2 confirms the parallel-MLP+attn-chain structure is the right base for further fat-block work.** Future variants should treat the parallel routing as fixed and modify other dimensions (per-attn nonlinearity, attn-count, MLP width) on top.
+
+### Implication for A3
+
+A3 (`leaky_attn`) keeps the parallel MLP, adds `leaky_relu(y, 0.5)²` on each fat-attention SDPA output. Of the three Sweep-2 variants, **A3 is the only one that adds nonlinearity instead of removing or rearranging it**. Given:
+
+- A1 (delete MLP, widen attn) lost 0.021 BPB pre-quant — **removing nonlinearity hurts a lot**
+- A2 (MLP sequential) lost 0.003 BPB pre-quant — **rearranging routing hurts a little**
+- A3 adds per-attn nonlinearity inside the chain — **most likely direction to improve**
+
+If A3 also fails, gated_ew is the architecture's local optimum and the path forward is 3-seed gated_ew confirmation + TTT (Sweep 1's parked next step), not more fat-block ablations.
+
+---
+
+## Sweep 2 — Variant 3 — `leaky_attn` (A3, seed 42, 2026-04-26)
+
+**Config**: `GATED_ATTN=1 GATED_ATTN_MODE=elementwise GLU_V=0 ATTN_OUTPUT_ACTIVATION=leaky_relu_sq MAX_WALLCLOCK_SECONDS=2400 TTT_ENABLED=0 SEED=42`.
+**Log**: `records/track_10min_16mb/2026-04-22_FatBlock_SeqAttn_ParMLP/logs/leaky_attn_s42.log`.
+**Model params**: 34,890,328 (34.89 M) — identical to gated_ew (the activation is parameterless).
+**Peak GPU memory**: 38,142 MiB / 80 GB.
+**End step**: 4876 (wallclock cap, 2389 s training).
+**Artifact**: 15,603,499 bytes (essentially tied with A2).
+
+### Training trajectory vs gated_ew and vanilla
+
+| Step | gated_ew (winner) | vanilla | A2 mlp_sequential | **A3 leaky_attn** | Δ vs gated_ew | Δ vs vanilla |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500  | 3.3206 | 3.3175 | 3.3195 | 3.3292 | +0.009 | +0.012 |
+| 1000 | 3.1847 | 3.1860 | 3.1877 | 3.1982 | +0.014 | +0.012 |
+| 1500 | 3.1573 | 3.1623 | 3.1653 | 3.1713 | +0.014 | +0.009 |
+| 2000 | 3.1481 | 3.1474 | 3.1522 | 3.1591 | +0.011 | +0.012 |
+| *layer_loop activated* | 2183 | 2231 | 2178 | **2178** | — | — |
+| 2500 | 3.0644 | 3.0753 | 3.0719 | 3.0777 | +0.013 | +0.002 |
+| 3000 | 3.0225 | 3.0279 | 3.0255 | 3.0293 | +0.007 | +0.001 |
+| 3500 | 2.9493 | 2.9560 | 2.9565 | 2.9571 | +0.008 | +0.001 |
+| 4000 | 2.8605 | 2.8718 | 2.8676 | 2.8688 | **+0.008** | −0.003 |
+| 4000 val_bpb | 1.1255 | 1.1295 | 1.1281 | 1.1292 | +0.0037 | −0.0003 |
+| 4500 | 2.8494 | 2.8600 | 2.8569 | 2.8585 | +0.009 | −0.002 |
+
+A3 trains nearly identically to vanilla and A2 on train_loss, but consistently 0.005–0.014 behind gated_ew. The `leaky_relu_sq` activation does not provide any optimization advantage over the no-op vanilla case.
+
+### Final evaluation numbers — A3 is the worst Sweep-2 variant on real numbers
+
+| Metric | SOTA | gated_ew | vanilla | A2 mlp_sequential | **A3 leaky_attn** | Δ vs gated_ew | Δ vs SOTA |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| End step | 4550 | 4895 | 4969 | 4877 | **4876** | — | — |
+| Pre-EMA pre-quant val_bpb | 1.0886 | 1.0883 | 1.0904 | 1.0912 | **1.09230** | +0.0040 | +0.0037 |
+| Quantized val_bpb | 1.0997 | 1.0996 | 1.1017 | 1.10235 | **1.10381** | +0.0042 | +0.0041 |
+| **Sliding val_bpb** | **1.0829** | **1.08292** | 1.08493 | 1.08576 | **1.08732** | **+0.00440** | **+0.00442** |
+| Artifact (bytes) | 15,992,694 | 15,600,043 | 15,153,396 | 15,603,261 | **15,603,499** | +3,456 | −0.4 MB |
+
+### Interpretation — adding nonlinearity hurt, didn't help
+
+1. **A3 < vanilla by +0.00239 sliding val_bpb.** The hypothesis was that `leaky_relu(y, 0.5).square()` on each fat-attention SDPA output would supply the per-token nonlinearity that the chain otherwise lacks. Instead, A3 is **worse than the no-activation vanilla baseline**.
+
+2. **Quantization penalty is normal (+0.0115).** Same shape as gated_ew/vanilla/A2, so the squared-leaky activation didn't make GPTQ harder — the loss is purely from worse pre-quant val_bpb. This rules out a "quantization-unfriendly activation" failure mode.
+
+3. **The elementwise gate is doing the nonlinearity work already.** gated_ew's 4.2 M elementwise gate parameters provide a very flexible nonlinearity per fat attention. Stacking a second, parameterless `leaky_relu_sq` on top apparently competes with or distorts the gate's signal rather than adding orthogonal capacity. A3 = gated_ew × (extra activation that the gate would have learned to apply if useful).
+
+4. **A3 is the worst Sweep-2 variant by sliding val_bpb (1.08732), worse than A2 (1.08576).** Earlier I framed A3 as "the strongest remaining bet" because it was the only variant *adding* nonlinearity; the data falsifies that framing. **The fat-block architecture, with the elementwise gate already in place, does not benefit from additional inter-attention nonlinearity.**
+
+---
+
+## Sweep 2 — final summary
+
+| Rank | Variant | Sliding val_bpb | Δ vs gated_ew | Δ vs vanilla | Δ vs SOTA | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| 0 (Sweep-1 winner) | gated_ew | **1.08292** | — | −0.00201 | +0.00006 | **local optimum** |
+| 0 (baseline) | vanilla | 1.08493 | +0.00201 | — | +0.00207 | reference |
+| Sweep-2 best | A2 `mlp_sequential` | 1.08576 | +0.00284 | +0.00083 | +0.00290 | ❌ worse than vanilla |
+| Sweep-2 mid | A3 `leaky_attn` | 1.08732 | +0.00440 | +0.00239 | +0.00442 | ❌ worse than vanilla |
+| Sweep-2 worst | A1 `delete_mlp_widen` | ~1.100 (projected) | ~+0.017 | ~+0.015 | ~+0.017 | ❌ abandoned (no quant artifact) |
+
+### Headline findings — Sweep 2
+
+1. **All three Sweep-2 architectural changes regress vs gated_ew.** The fat-block design space has a sharp local optimum at `gated_ew` for this scale (10-min track, 16 MB).
+2. **All three regress vs the simpler `vanilla` baseline as well** — meaning these aren't just "didn't beat the winner" but actively worse than the no-frills fat-block. A2 by +0.001, A3 by +0.002, A1 by +0.015.
+3. **The fat block does not need additional per-token nonlinearity.** A1 (remove MLP) and A3 (add per-attn nonlinearity) both lose. The elementwise gate is already supplying enough.
+4. **The fat block does not benefit from rerouting the MLP.** A2 confirmed that parallel MLP (reads `x_in`) beats sequential MLP (reads `z`). Parallel routing is the right base structure.
+5. **gated_ew is confirmed as the architecture's local optimum** — further fat-block ablations are unlikely to beat it without a different design axis (more attentions, wider MLP, different gate placement, or stepping outside the fat-block altogether).
+
+### Recommended next steps
+
+1. **3-seed gated_ew confirmation** (seeds 314 + 999) — Sweep-1 parked this; with Sweep 2 done, it's now the highest-priority remaining action. A 3-seed mean ≤ 1.0828 with std ≤ 0.0003 establishes SOTA-parity at multi-seed, which is the publishable result.
+2. **gated_ew + TTT** — Sweep 1 noted ~0.002 BPB headroom from TTT on this stack. If realized, gated_ew+TTT lands ~1.0810, matching SOTA's TTT headline.
+3. **Step outside fat-block design space** if (1) and (2) don't break SOTA — e.g., parallel-residual depth recurrence (PR #1493 family), or an entirely different backbone direction. The fat-block ceiling at this scale is ~1.0829 (gated_ew); pushing below requires structural changes elsewhere.
+4. **Skip further fat-block ablations.** The backlog items beyond A1/A2/A3 (5 sequential attentions, wider fat MLP, per-attn QK-norm) are now lower priority — Sweep-2 evidence is that the fat block as configured is at its local optimum, and modifications are net-negative. Reroute compute to (1)/(2)/(3).
+
+---
+
 ## Changelog
 
 - **2026-04-23**: Initial write-up with vanilla (seed 42) result.
+- **2026-04-26**: Sweep-2 variant 1 (`delete_mlp_widen`, A1) abandoned after partial run — pre-quant val_bpb 1.10915 (+0.021 vs gated_ew), projected sliding ~1.100. A1 hypothesis (artifact savings beat lost MLP capacity) refuted. Brotli pre-flight added to `run_sweep2.sh`.
+- **2026-04-26**: Sweep-2 variant 2 (`mlp_sequential`, A2) completed — sliding val_bpb 1.08576 (+0.00284 vs gated_ew, +0.00083 vs vanilla, **outside backlog pessimistic of 1.0850**). Sequential MLP routing is strictly worse than parallel. Parallel MLP + attn-chain is now confirmed as the right base structure for further fat-block work.
+- **2026-04-26**: Sweep-2 variant 3 (`leaky_attn`, A3) completed — sliding val_bpb 1.08732 (+0.00440 vs gated_ew, +0.00239 vs vanilla, the **worst** of the three Sweep-2 variants on real numbers). Adding per-attn nonlinearity on top of the elementwise gate hurt rather than helped. **Sweep 2 closed: gated_ew confirmed as local optimum of the fat-block design space.** Recommended next: 3-seed gated_ew confirmation, gated_ew + TTT, or a different backbone direction.
