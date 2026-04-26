@@ -27,6 +27,10 @@
 #     for V in delete_mlp_widen mlp_sequential leaky_attn; do ./run.sh $V; done
 
 set -e
+# pipefail propagates the torchrun exit code through the `| tee` pipeline.
+# Without this, training crashes are masked by tee's 0 exit and the script
+# pretends the run succeeded (which then poisons any wrapper's success check).
+set -o pipefail
 
 # Defensively unset any shell-exported vars that could leak into the training run.
 # (Needed because earlier smoke-test sessions may have `export`ed these, and

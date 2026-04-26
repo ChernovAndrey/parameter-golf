@@ -50,19 +50,18 @@ for V in "${VARIANTS[@]}"; do
     # Make sure no stale artifact from a previous crashed variant leaks in.
     rm -f final_model.pt final_model.int6.ptz
 
-    if ./run.sh "$V" "$SEED"; then
-        if [ -f final_model.int6.ptz ]; then
-            mv final_model.int6.ptz "artifacts/${V}_s${SEED}_final_model.int6.ptz"
-            STATUS[$V]="ok"
-        else
-            STATUS[$V]="ok-no-artifact"
-        fi
-        rm -f final_model.pt
-    else
-        RC=$?
+    RC=0
+    ./run.sh "$V" "$SEED" || RC=$?
+    if [ "$RC" -eq 0 ] && [ -f final_model.int6.ptz ]; then
+        mv final_model.int6.ptz "artifacts/${V}_s${SEED}_final_model.int6.ptz"
+        STATUS[$V]="ok"
+    elif [ "$RC" -ne 0 ]; then
         STATUS[$V]="FAILED(rc=${RC})"
-        rm -f final_model.pt final_model.int6.ptz
+    else
+        # run.sh returned 0 but the artifact was never produced — treat as failure.
+        STATUS[$V]="FAILED(no_artifact)"
     fi
+    rm -f final_model.pt final_model.int6.ptz
 
     TS_END=$(date -Iseconds 2>/dev/null || date)
     echo "### END   $V seed=$SEED $TS_END  [${STATUS[$V]}]" | tee -a "$SWEEP_LOG"
@@ -84,10 +83,12 @@ done
         QUANT="-"
         ART="-"
         if [ -f "$LOG" ]; then
-            LINE=$(grep 'quantized_sliding_window' "$LOG" 2>/dev/null | tail -1)
-            [ -n "$LINE" ] && SLIDE=$(echo "$LINE" | awk '{print $NF}')
+            # Lines look like: "<label> val_loss:<x> val_bpb:<y> eval_time:<z>ms".
+            # Extract the val_bpb value specifically — $NF would give eval_time.
+            LINE=$(grep 'quantized_sliding_window val_loss' "$LOG" 2>/dev/null | tail -1)
+            [ -n "$LINE" ] && SLIDE=$(echo "$LINE" | grep -oE 'val_bpb:[0-9.]+' | head -1 | cut -d: -f2)
             LINE=$(grep '^quantized val_loss' "$LOG" 2>/dev/null | tail -1)
-            [ -n "$LINE" ] && QUANT=$(echo "$LINE" | awk '{print $NF}')
+            [ -n "$LINE" ] && QUANT=$(echo "$LINE" | grep -oE 'val_bpb:[0-9.]+' | head -1 | cut -d: -f2)
             LINE=$(grep 'Total submission size' "$LOG" 2>/dev/null | tail -1)
             [ -n "$LINE" ] && ART=$(echo "$LINE" | awk '{print $(NF-1)}')
         fi
