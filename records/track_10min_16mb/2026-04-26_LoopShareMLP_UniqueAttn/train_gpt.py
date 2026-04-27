@@ -1161,7 +1161,22 @@ def serialize(h, base_model, code):
         model_bytes = os.path.getsize(h.model_path)
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size: {code_bytes} bytes")
-    sd_cpu = {k: v.detach().cpu() for (k, v) in base_model.state_dict().items()}
+    # Build sd_cpu while preserving shared-parameter aliasing. PyTorch's state_dict
+    # emits multiple alias keys for shared modules (LOOP_SHARED_MLP) — all pointing
+    # at the same GPU tensor. A naive `.cpu()` per-key creates separate CPU buffers,
+    # which breaks the downstream data_ptr-based alias dedup in gptq_mixed_quantize
+    # (canonical hessian key lookup fails for the alias keys with KeyError).
+    # Dedup at the GPU level FIRST so alias keys map to the SAME CPU tensor.
+    _sd_gpu = base_model.state_dict()
+    _seen_gpu_ptrs = {}  # GPU data_ptr -> canonical state_dict key
+    sd_cpu = {}
+    for _k, _v in _sd_gpu.items():
+        _gpu_ptr = _v.data_ptr()
+        if _gpu_ptr in _seen_gpu_ptrs:
+            sd_cpu[_k] = sd_cpu[_seen_gpu_ptrs[_gpu_ptr]]
+        else:
+            _seen_gpu_ptrs[_gpu_ptr] = _k
+            sd_cpu[_k] = _v.detach().cpu()
     device = torch.device('cuda', h.local_rank)
     log('GPTQ:collecting Hessians from calibration data...')
     t0 = time.perf_counter()

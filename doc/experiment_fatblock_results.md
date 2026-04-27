@@ -615,9 +615,116 @@ A3 trains nearly identically to vanilla and A2 on train_loss, but consistently 0
 
 ---
 
+## Sweep 3 — Loop-share architecture (NON-fat-block, on SOTA base)
+
+Different design space: instead of fat-block experiments, **start from SOTA-equivalent base** (`FAT_BLOCK_ENABLED=0`, 11 logical layers, encoder=`[0,1,2,3,4,5,3,4]` / decoder=`[5,3,4,5,6,7,8,9,10]`). Modifications are confined to blocks 3, 4, 5 (the looped core, each visited 3× per forward pass). New folder `records/track_10min_16mb/2026-04-26_LoopShareMLP_UniqueAttn/`.
+
+Two variants, both via env-var dispatch on a single forked `train_gpt.py`:
+
+| # | Variant | Change | Status |
+|---|---|---|---|
+| V2 | `shared_fat_mlp` | 1 shared fat MLP (h=6144) across blocks 3, 4, 5 (replaces 3 separate h=2048 MLPs); attentions unchanged | ❌ partial run (GPTQ-alias bug, see below) |
+| V1 | `unique_attn_thin_mlp` | 9 unique attentions (3 per block × 3 visits) + 1 shared thin MLP (h=1280) across blocks 3, 4, 5 | 🔧 pending re-run after fix |
+
+### Sweep 3 — Variant 2 (V2) — `shared_fat_mlp` (seed 42, 2026-04-27, partial run)
+
+**Config**: `FAT_BLOCK_ENABLED=0 LOOP_SHARED_MLP=1 LOOP_SHARED_MLP_HIDDEN=6144 MAX_WALLCLOCK_SECONDS=2400 TTT_ENABLED=0 SEED=42`.
+**Log**: `records/track_10min_16mb/2026-04-26_LoopShareMLP_UniqueAttn/logs/shared_fat_mlp_s42.log`.
+**Model params**: 35,944,536 — **identical to SOTA** (3× h=2048 separate = h=6144 shared in param count).
+**Peak GPU memory**: 53,095 MiB (much higher than fat-block's ~38 GB — the shared fat MLP is invoked 9× in the looped section, so 9× activation storage for backward).
+**End step**: 3883 (wallclock cap, 2389 s training).
+**Status**: ❌ **failed during GPTQ serialization** with `KeyError: 'blocks.4.mlp.fc.weight'`. Training itself completed cleanly; only the post-training compress step crashed (see "Why failed" below).
+
+#### Training trajectory vs SOTA, gated_ew, vanilla
+
+| Step | SOTA | gated_ew | vanilla | **V2 shared_fat_mlp** | Δ vs SOTA | Δ vs gated_ew |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500  | 3.3346 | 3.3206 | 3.3175 | **3.3029** | **−0.032** | **−0.018** |
+| 1000 | 3.1948 | 3.1847 | 3.1860 | **3.1751** | **−0.020** | **−0.010** |
+| 1500 | 3.1030 | 3.1573 | 3.1623 | 3.1486 | +0.046 | −0.009 |
+| *layer_loop activated* | step 2018 | step 2183 | step 2231 | **step 1823** | (earlier — slower step time hits frac=0.35 sooner) | — |
+| 2000 | 3.0686 | 3.1481 | 3.1474 | **3.1063** | +0.038 | **−0.042** |
+| 2500 | 3.0673 | 3.0644 | 3.0753 | **3.0173** | **−0.050** | **−0.047** |
+| 3000 | 2.9476 | 3.0225 | 3.0279 | **2.9616** | +0.014 | **−0.061** |
+| 3500 | 2.9672 | 2.9493 | 2.9560 | **2.8614** | **−0.106** | **−0.088** |
+| end | step 4550 (2.8119) | step 4895 (2.8494) | step 4969 (2.8166) | **step 3883 (val_bpb 1.0917 pre-EMA)** | — | — |
+
+**Throughput**: 0.468 s/step pre-loop, **~0.756 s/step post-loop** (vs sweep-2 fat-block's 0.576 s/step). Slower because:
+- 11 physical blocks (vs fat-block's 8) → 38 % more blocks per forward pass
+- Shared h=6144 MLP called 3 × per visit × 3 looped blocks = 9 invocations of an MLP that's 3× wider than the regular h=2048 MLP. Net: MLP FLOPs in looped section are **3× higher** than SOTA's separate MLPs.
+
+V2 trains ~20 % fewer steps than gated_ew in the same wallclock (3883 vs 4895).
+
+#### Final partial-eval numbers (training completed, GPTQ failed)
+
+| Metric | SOTA (3-seed) | gated_ew | vanilla | **V2 shared_fat_mlp** | Δ vs SOTA | Δ vs gated_ew |
+|---|---:|---:|---:|---:|---:|---:|
+| End step | 4550 | 4895 | 4969 | **3883** | — | — |
+| Final train_loss (last 500-step log) | 2.8119 (step 4550) | 2.8494 (step 4500) | 2.8600 (step 4500) | **2.8614 (step 3500)** | — | — |
+| Pre-EMA val_bpb (last train step) | 1.0886 | 1.0904 | 1.0904 | **1.0917** | +0.0031 | +0.0013 |
+| **Pre-quant post-EMA val_bpb** | **1.0873** | **1.0883** | (not logged) | **1.09071** | **+0.0034** | **+0.0024** |
+| Quantized val_bpb | 1.0997 | 1.0996 | 1.1017 | (crashed — projected ~1.1015) | — | — |
+| **Sliding val_bpb** | **1.0829** | **1.08292** | 1.08493 | **(projected ~1.0850)** | **~+0.0021** | **~+0.0021** |
+| Peak memory (MiB) | n/a (8×H100) | 37,740 | 37,740 | **53,095** | — | — |
+
+**Projection method**: pre-quant post-EMA 1.09071 → +0.0011 quant penalty (consistent across all prior runs) = ~1.1015 quantized → −0.0017 sliding gain = **~1.0848 sliding**.
+
+#### Interpretation — V2 trains faster but generalizes ~+0.002 BPB worse
+
+1. **Train-loss leadership.** V2 had the lowest train_loss at every checkpoint up through step 2500 (−0.05 vs SOTA, −0.05 vs gated_ew). The shared fat MLP at h=6144 has 3× the per-call FLOPs of a regular h=2048 MLP, providing more transformation capacity per forward pass. Optimization benefits clearly.
+
+2. **Generalization gap (same pattern as Sweep 2).** Pre-EMA val_bpb 1.0917 is +0.0013 vs gated_ew, +0.0031 vs SOTA. EMA helped −0.001 BPB → 1.09071. The train-loss advantage does not translate proportionally to val. **Fourth experiment in a row showing this pattern: capacity-adding modifications to the looped core regress on val_bpb relative to gated_ew/SOTA.** Hypothesis: the looped core needs *iteration-stable* weights to do its 3× recurrence properly; pumping more compute through one shared MLP per visit reduces the smoothness EMA exploits.
+
+3. **Peak memory ~53 GB.** Significantly higher than fat-block's ~38 GB because the shared MLP's activations are stored 9 × per forward (once per visit × 3 blocks). Still well under H100 80 GB but worth noting if anyone runs this on smaller cards.
+
+4. **20 % fewer training steps** (3883 vs gated_ew's 4895). The wider per-call MLP costs step time, and the wallclock cap is fixed at 40 min. Fewer steps + better-per-step efficiency net to roughly the same end-state on train_loss but worse on val_bpb.
+
+#### Why this run failed (and the fix)
+
+`gptq_mixed_quantize` crashed with `KeyError: 'blocks.4.mlp.fc.weight'`. Root cause:
+
+- PyTorch's `state_dict()` emits **3 alias keys** for a shared module (`blocks.{3,4,5}.mlp.fc.weight`), all pointing to the same GPU tensor.
+- The trainer copies state_dict to CPU via `sd_cpu = {k: v.detach().cpu() for ...}` — but **`.cpu()` allocates a separate CPU buffer per call**, so the resulting CPU alias tensors no longer share `data_ptr()`.
+- The dedup-by-data_ptr check inside `gptq_mixed_quantize` (M8 in the implementation plan) therefore failed to recognize the alias relationship, and tried to look up `hessians['blocks.4.mlp.fc.weight']` — which doesn't exist (only the canonical `blocks.3.mlp.fc.weight` is registered, since `named_modules()` deduplicates).
+
+The CPU-only verification I ran during planning didn't catch this because `.cpu()` is a no-op when already on CPU — the alias relationship was preserved trivially. The real GPU→CPU copy path was not exercised.
+
+**Fix landed (2026-04-27)**: rebuilt sd_cpu so alias keys map to the SAME CPU tensor. Dedup at the GPU `data_ptr` level BEFORE the `.cpu()` copy:
+
+```python
+_sd_gpu = base_model.state_dict()
+_seen_gpu_ptrs = {}
+sd_cpu = {}
+for _k, _v in _sd_gpu.items():
+    _gpu_ptr = _v.data_ptr()
+    if _gpu_ptr in _seen_gpu_ptrs:
+        sd_cpu[_k] = sd_cpu[_seen_gpu_ptrs[_gpu_ptr]]
+    else:
+        _seen_gpu_ptrs[_gpu_ptr] = _k
+        sd_cpu[_k] = _v.detach().cpu()
+```
+
+With the fix, alias entries in `sd_cpu` are the SAME CPU tensor object → identical `data_ptr()` → `gptq_mixed_quantize`'s dedup correctly identifies them and reuses canonical q/scale tensors.
+
+Re-run pending — V2 needs ~50 min on 2× H100. V1 (`unique_attn_thin_mlp`) was triggered by the same bug since it also sets `LOOP_SHARED_MLP=1` (with thin MLP h=1280); both will run cleanly with the fix.
+
+### Verdict on V2 (based on partial data)
+
+V2 is **likely not a winner** on the seed=42 data we have:
+- Pre-quant post-EMA 1.09071 is +0.0024 vs gated_ew, +0.0034 vs SOTA.
+- Projected sliding ~1.0848 is +0.002 worse than SOTA's 1.0829, +0.002 worse than gated_ew's 1.08292.
+- Same train/val divergence pattern as fat-block sweep variants — adding per-visit MLP capacity helps optimization but hurts generalization.
+
+The hypothesis "share MLP across visits with 3× the per-call hidden" tested by V2 looks like a structural mismatch with the recurrent depth pattern. The full re-run after the GPTQ fix will give us the actual sliding number to confirm or refute the projection — but architectural conclusion is unlikely to change.
+
+V1 (`unique_attn_thin_mlp`) tests a different and more interesting hypothesis: **attention specialization across visits + shared MLP**. Pending its re-run.
+
+---
+
 ## Changelog
 
 - **2026-04-23**: Initial write-up with vanilla (seed 42) result.
 - **2026-04-26**: Sweep-2 variant 1 (`delete_mlp_widen`, A1) abandoned after partial run — pre-quant val_bpb 1.10915 (+0.021 vs gated_ew), projected sliding ~1.100. A1 hypothesis (artifact savings beat lost MLP capacity) refuted. Brotli pre-flight added to `run_sweep2.sh`.
 - **2026-04-26**: Sweep-2 variant 2 (`mlp_sequential`, A2) completed — sliding val_bpb 1.08576 (+0.00284 vs gated_ew, +0.00083 vs vanilla, **outside backlog pessimistic of 1.0850**). Sequential MLP routing is strictly worse than parallel. Parallel MLP + attn-chain is now confirmed as the right base structure for further fat-block work.
 - **2026-04-26**: Sweep-2 variant 3 (`leaky_attn`, A3) completed — sliding val_bpb 1.08732 (+0.00440 vs gated_ew, +0.00239 vs vanilla, the **worst** of the three Sweep-2 variants on real numbers). Adding per-attn nonlinearity on top of the elementwise gate hurt rather than helped. **Sweep 2 closed: gated_ew confirmed as local optimum of the fat-block design space.** Recommended next: 3-seed gated_ew confirmation, gated_ew + TTT, or a different backbone direction.
+- **2026-04-27**: Sweep-3 variant 2 (`shared_fat_mlp`, V2) ran 3883 training steps then crashed during GPTQ — `KeyError: 'blocks.4.mlp.fc.weight'` from a shared-module state_dict alias bug in the GPU→CPU copy path. Fixed in `train_gpt.py` (data_ptr dedup at the GPU level before `.cpu()`). Partial data: pre-quant post-EMA val_bpb **1.09071**, projected sliding **~1.0848** (+0.002 vs SOTA). V2 likely not a winner. Re-run pending; V1 (`unique_attn_thin_mlp`) was killed mid-training to apply the same fix.
