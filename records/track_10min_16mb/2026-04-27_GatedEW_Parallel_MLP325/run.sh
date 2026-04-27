@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launcher for "Gated_EW on parallel layers only + MLP 3.1x targeted shrink".
+# Launcher for "Gated_EW on parallel layers only + MLP 3.25x targeted shrink".
 # 2x H100, 40 min training (eval ~9 min more).
 #
 # Architecture (vs PR #1493 SOTA, 1.0810 BPB):
@@ -9,11 +9,12 @@
 #   Layers 7-10 (parallel residual)
 #       + Qwen G1 elementwise gate: y = sigmoid(W_g x) * Attn(x), W_g [512->512]
 #         4 gates x 262K = 1.05M params (~+0.50 MB after int6 GPTQ + Brotli)
-#       - MLP_MULT 4.0 -> 3.1 (h=2048 -> 1587)
-#         Saves 4 x 2 x 512 x 461 = 1.89M params (~-0.90 MB)
-#       Per-token MLP volume in this zone: 4 x 1587 = 6348, vs FatBlock's
-#       validated regime of 1 x 6144 (within 3%).
-#   = Net artifact: ~15.63 MB (predicted, ~370 KB headroom)
+#       - MLP_MULT 4.0 -> 3.25 (h=2048 -> 1664)
+#         Saves 4 x 2 x 512 x 384 = 1.57M params (~-0.77 MB)
+#         h=1664 = 13x128, so all GPTQ blocks divide cleanly (no partial blocks).
+#       Per-token MLP volume in this zone: 4 x 1664 = 6656, vs FatBlock's
+#       validated regime of 1 x 6144 (~8%).
+#   = Net artifact: ~15.79 MB (predicted, ~210 KB headroom)
 #     Fallback: drop PARALLEL_MLP_MULT to 3.0 (~490 KB headroom) if over budget.
 #
 # Variants:
@@ -57,7 +58,7 @@ case "$VARIANT" in
         export GATED_ATTN_ENABLED=1
         export GATED_ATTN_MODE=elementwise
         export MLP_MULT=4.0
-        export PARALLEL_MLP_MULT=3.1
+        export PARALLEL_MLP_MULT=3.25
         export MAX_WALLCLOCK_SECONDS=30
         export TRAIN_BATCH_TOKENS=65536
         export WARMUP_STEPS=1
@@ -68,7 +69,7 @@ case "$VARIANT" in
         export GATED_ATTN_ENABLED=1
         export GATED_ATTN_MODE=elementwise
         export MLP_MULT=4.0
-        export PARALLEL_MLP_MULT=3.1
+        export PARALLEL_MLP_MULT=3.25
         export MAX_WALLCLOCK_SECONDS=2400
         export TRAIN_BATCH_TOKENS=786432
         export WARMUP_STEPS=20
@@ -80,7 +81,7 @@ case "$VARIANT" in
         # gate is not pulling its weight; if Δ > 0.001 BPB, the gate adds real value.
         export GATED_ATTN_ENABLED=0
         export MLP_MULT=4.0
-        export PARALLEL_MLP_MULT=3.1
+        export PARALLEL_MLP_MULT=3.25
         export MAX_WALLCLOCK_SECONDS=2400
         export TRAIN_BATCH_TOKENS=786432
         export WARMUP_STEPS=20
