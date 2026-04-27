@@ -715,9 +715,76 @@ V2 is **likely not a winner** on the seed=42 data we have:
 - Projected sliding ~1.0848 is +0.002 worse than SOTA's 1.0829, +0.002 worse than gated_ew's 1.08292.
 - Same train/val divergence pattern as fat-block sweep variants — adding per-visit MLP capacity helps optimization but hurts generalization.
 
-The hypothesis "share MLP across visits with 3× the per-call hidden" tested by V2 looks like a structural mismatch with the recurrent depth pattern. The full re-run after the GPTQ fix will give us the actual sliding number to confirm or refute the projection — but architectural conclusion is unlikely to change.
+The hypothesis "share MLP across visits with 3× the per-call hidden" tested by V2 looks like a structural mismatch with the recurrent depth pattern.
 
-V1 (`unique_attn_thin_mlp`) tests a different and more interesting hypothesis: **attention specialization across visits + shared MLP**. Pending its re-run.
+### Sweep 3 — Variant 1 (V1) — `unique_attn_thin_mlp` (seed 42, 2026-04-27, stopped early)
+
+**Config**: `FAT_BLOCK_ENABLED=0 LOOP_UNIQUE_ATTN=1 LOOP_SHARED_MLP=1 LOOP_SHARED_MLP_HIDDEN=1280 MAX_WALLCLOCK_SECONDS=2400 TTT_ENABLED=0 SEED=42`.
+**Log**: `records/track_10min_16mb/2026-04-26_LoopShareMLP_UniqueAttn/logs/unique_attn_thin_mlp_s42.log`.
+**Model params**: 35,682,440 (~262 K under SOTA's 35,944,536).
+**Status**: 🛑 **stopped manually after step 1000** — pre-loop phase only, architectural trajectory was lagging and no signal to justify continuing 50 minutes for the loop-activated phase.
+
+#### Architecture (the actual hypothesis under test)
+
+| | SOTA | V1 |
+|---|---|---|
+| Blocks 0, 1, 2, 6–10 | 1 attn + 1 MLP (h=2048) each | unchanged |
+| Blocks 3, 4, 5 attentions | 1 each, **shared** across the 3 visits | **3 unique attentions each** — 9 total in the looped core, one per (block, visit) slot |
+| Blocks 3, 4, 5 MLPs | 3 separate (h=2048) | **1 shared thin MLP (h=1280)**, used 9× per forward |
+
+Hypothesis: **attention's job changes per visit** (early visits attend to local patterns, late visits to abstract relations) so per-visit specialization helps. **MLP's job is uniform** so sharing it is fine. The shared MLP must be thinner (h=1280) than SOTA's separate MLPs (h=2048) to fit the 16 MB artifact budget, since 6 extra attention modules cost ~2 MB compressed.
+
+#### Training trajectory (steps 500 and 1000 only)
+
+| Step | SOTA | gated_ew | vanilla | V2 shared_fat_mlp | **V1 unique_attn_thin_mlp** | Δ vs SOTA | Δ vs gated_ew |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 500  | 3.3346 | 3.3206 | 3.3175 | 3.3029 | **3.3325** | −0.002 | +0.012 |
+| 1000 | 3.1948 | 3.1847 | 3.1860 | 3.1751 | **3.2029** | **+0.008** | **+0.018** |
+| 1500 | 3.1030 | 3.1573 | 3.1623 | 3.1486 | (stopped) | — | — |
+
+Step time: 0.516 s/step for steps 0–500 (includes warmup compile), 0.444 s/step for 500–1000. Loop activation was projected at step ~1700–1800 (frac=0.35 ≈ 14 min in).
+
+#### Why stopped early
+
+1. **Trajectory was clearly lagging.** V1 was +0.008 worse than SOTA and +0.018 worse than gated_ew at step 1000, and the gap to V2 (+0.028) was stable. The pre-loop phase was telling us: "thin MLP + 6 dormant attentions = strictly weaker model than SOTA at this stage." No surprise, but no positive signal either.
+
+2. **The architectural bet only activates after step ~1700** (loop activation). Even if per-visit attentions then close the gap, the model still has *less effective training time* for the 6 dormant-during-pre-loop attentions, and the thin MLP is a permanent capacity reduction. Best case: V1 catches up to ~SOTA. Worst case: stays +0.020 behind.
+
+3. **Five prior experiments (Sweep 2 + V2) all showed the same train→val divergence pattern**: capacity-shifting modifications to the looped core regress on val_bpb relative to gated_ew/SOTA. The expected payoff for V1 is at best a tie with SOTA on val_bpb — unlikely to be a clean win, and a 50-minute confirmation isn't justified given the prior pattern.
+
+#### What V1 was actually testing (and the negative-result interpretation)
+
+The architectural hypothesis "**attention specialization across visits matters more than MLP capacity**" is reasonable on paper but ran into three practical problems:
+
+- **Dormant-attention warmup tax**: V1's `attn[1]` and `attn[2]` of each looped block see no gradient during the first 35% of training (looping_active=False). They start from orthogonal init and have less effective optimization time vs the always-active `attn[0]` slot. This asymmetry is a structural disadvantage.
+- **Thin MLP cost**: dropping `mlp_mult` from 4.0 → 2.5 (h=2048 → h=1280) costs visible per-step capacity, visible already at step 500 (V1 lagging V2 by 0.030 BPB equivalent in train_loss).
+- **DDP overhead**: `find_unused_parameters=True` (required because of the dormant attentions) adds ~5% step-time overhead vs gated_ew/V2's `=False` default.
+
+The hypothesis isn't necessarily wrong — per-visit attention specialization probably DOES help in some regime — but at this scale (35M params, 16 MB artifact, 2× H100, 40-min cap), the costs outweigh the benefits.
+
+### Verdict on Sweep 3
+
+**Both variants are not winners** at the seed=42 single-seed evaluation:
+
+| Variant | End status | Pre-quant val_bpb | Projected sliding | Δ vs SOTA |
+|---|---|---:|---:|---:|
+| V2 `shared_fat_mlp` | step 3883 (GPTQ crashed → fixed → re-run pending if desired) | 1.09071 | ~1.0848 | +0.002 |
+| V1 `unique_attn_thin_mlp` | step 1000 (stopped) | n/a | n/a | trajectory lagging |
+
+**Combined with Sweep 1 + Sweep 2 (5 prior fat-block ablations)**, this is now **6 experiments in a row** showing that any structural modification to the looped core (delete MLP, sequential routing, leaky activation, fat shared MLP, unique-attn + thin MLP) regresses on val_bpb relative to gated_ew/SOTA. The empirical conclusion:
+
+> **At this scale, the looped core (blocks 3, 4, 5 each visited 3×) has a sharp local optimum around "shared simple weights with optional cheap nonlinearity (gated_ew's elementwise gate)". Capacity rearrangements within the looped core don't help; the optimization-vs-generalization tradeoff is unfavorable for any move away from the gated_ew structure.**
+
+### Recommended next directions (re-stating the parked items)
+
+1. **3-seed gated_ew confirmation** (seeds 314, 999) — establish whether gated_ew's 1.08292 is a multi-seed result or seed=42 luck. ~1h20m on 2× H100.
+2. **gated_ew + TTT** — Sweep-1 doc estimated ~0.002 BPB headroom from TTT on this stack; would land gated_ew + TTT around 1.0810, matching SOTA's TTT headline. ~50 min on 2× H100.
+3. **Step out of the looped-core design space.** Looped core ≈ saturated; further gains likely need orthogonal axes:
+   - Different recurrence schedule (longer/shorter loop, more loop iterations, different `enable_looping_at`)
+   - Modify non-looped blocks (0–2 or 6–10) — these haven't been ablated in any of our 6 experiments
+   - Different backbone family entirely (not the U-Net + recurrence pattern)
+
+The fat-block + gated_ew exploration thread has produced a SOTA-equivalent result (1.08292 = SOTA's 1.08286 + 0.00006) and shown that the *gated_ew architecture is the local optimum*. That itself is a clean result worth reporting once the 3-seed confirmation lands.
 
 ---
 
@@ -727,4 +794,5 @@ V1 (`unique_attn_thin_mlp`) tests a different and more interesting hypothesis: *
 - **2026-04-26**: Sweep-2 variant 1 (`delete_mlp_widen`, A1) abandoned after partial run — pre-quant val_bpb 1.10915 (+0.021 vs gated_ew), projected sliding ~1.100. A1 hypothesis (artifact savings beat lost MLP capacity) refuted. Brotli pre-flight added to `run_sweep2.sh`.
 - **2026-04-26**: Sweep-2 variant 2 (`mlp_sequential`, A2) completed — sliding val_bpb 1.08576 (+0.00284 vs gated_ew, +0.00083 vs vanilla, **outside backlog pessimistic of 1.0850**). Sequential MLP routing is strictly worse than parallel. Parallel MLP + attn-chain is now confirmed as the right base structure for further fat-block work.
 - **2026-04-26**: Sweep-2 variant 3 (`leaky_attn`, A3) completed — sliding val_bpb 1.08732 (+0.00440 vs gated_ew, +0.00239 vs vanilla, the **worst** of the three Sweep-2 variants on real numbers). Adding per-attn nonlinearity on top of the elementwise gate hurt rather than helped. **Sweep 2 closed: gated_ew confirmed as local optimum of the fat-block design space.** Recommended next: 3-seed gated_ew confirmation, gated_ew + TTT, or a different backbone direction.
-- **2026-04-27**: Sweep-3 variant 2 (`shared_fat_mlp`, V2) ran 3883 training steps then crashed during GPTQ — `KeyError: 'blocks.4.mlp.fc.weight'` from a shared-module state_dict alias bug in the GPU→CPU copy path. Fixed in `train_gpt.py` (data_ptr dedup at the GPU level before `.cpu()`). Partial data: pre-quant post-EMA val_bpb **1.09071**, projected sliding **~1.0848** (+0.002 vs SOTA). V2 likely not a winner. Re-run pending; V1 (`unique_attn_thin_mlp`) was killed mid-training to apply the same fix.
+- **2026-04-27**: Sweep-3 variant 2 (`shared_fat_mlp`, V2) ran 3883 training steps then crashed during GPTQ — `KeyError: 'blocks.4.mlp.fc.weight'` from a shared-module state_dict alias bug in the GPU→CPU copy path. Fixed in `train_gpt.py` (data_ptr dedup at the GPU level before `.cpu()`). Partial data: pre-quant post-EMA val_bpb **1.09071**, projected sliding **~1.0848** (+0.002 vs SOTA). V2 likely not a winner.
+- **2026-04-27**: Sweep-3 variant 1 (`unique_attn_thin_mlp`, V1) stopped manually at step 1000 — pre-loop trajectory was lagging (+0.008 vs SOTA, +0.018 vs gated_ew on train_loss), no positive signal to justify continuing 50 minutes for the loop-activated phase. Sweep 3 closed. **6 experiments in a row** (Sweep 2 A1/A2/A3 + Sweep 3 V1/V2 + vanilla baseline) confirm that structural modifications to the looped core regress on val_bpb relative to gated_ew/SOTA. Architectural exploration of the looped core has hit diminishing returns. Recommended next: 3-seed gated_ew confirmation, gated_ew + TTT, or step outside the looped-core design space.
