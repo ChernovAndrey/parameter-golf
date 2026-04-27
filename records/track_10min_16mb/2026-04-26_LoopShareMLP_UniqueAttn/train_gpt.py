@@ -630,8 +630,9 @@ class FatBlock(nn.Module):
     def forward(self, x, x0, visit_count=0):
         # visit_count accepted for signature compatibility with Block (so that
         # GPT.forward_logits can pass it uniformly); FatBlock has no per-visit
-        # specialization and the value is ignored.
-        del visit_count
+        # specialization and the value is ignored. (Avoiding `del` to keep
+        # the bytecode dynamo-friendly under fullgraph compilation.)
+        _ = visit_count  # noqa: F841 — intentionally unused
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         # --- Attention chain: sequential refinement ---
