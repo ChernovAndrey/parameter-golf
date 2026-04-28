@@ -40,6 +40,14 @@
 set -e
 set -o pipefail
 
+# Ensure brotli is installed (project default COMPRESSOR=brotli; H100 container
+# does NOT have it pre-installed — and a missing brotli only fails 40 min in
+# during serialize, after training is otherwise complete).
+if ! python3 -c "import brotli" 2>/dev/null; then
+    echo "[setup] brotli not installed — installing now..."
+    pip install brotli
+fi
+
 # Defensively unset any inherited vars that could leak into the run.
 unset GATED_ATTN_ENABLED GATED_ATTN_MODE MLP_MULT PARALLEL_MLP_MULT \
       TRAIN_BATCH_TOKENS WARMUP_STEPS MAX_WALLCLOCK_SECONDS \
