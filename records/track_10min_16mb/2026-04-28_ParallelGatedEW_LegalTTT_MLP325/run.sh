@@ -71,7 +71,11 @@ preflight () {
 
     # 1d) Print versions
     python3 -c "import torch; print(f'[preflight] torch={torch.__version__}  cuda={torch.version.cuda}')"
-    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -1 | awk '{print "[preflight] GPU:", $0}'
+    # Capture first line of nvidia-smi output without `head -1` in a pipeline
+    # (which triggers SIGPIPE on nvidia-smi → fails with set -o pipefail).
+    local gpu_info=""
+    gpu_info=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | { read -r line; echo "$line"; } || true)
+    echo "[preflight] GPU: $gpu_info"
 }
 preflight
 
