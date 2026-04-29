@@ -1,0 +1,43 @@
+{
+  "author": "TODO_FILL_AUTHOR",
+  "github_id": "TODO_FILL_GITHUB_ID",
+  "name": "Parallel-Zone Gated Attention (elementwise) + Targeted MLP 3.25x + Legal Score-First TTT",
+  "date": "2026-04-28",
+  "track": "10min_16mb",
+
+  "_FILL_AFTER_RUNS": "Replace the val_bpb/std/seed_results below with numbers from train_seed{42,314,999}.log after all 3 runs complete.",
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "seeds": [42, 314, 999],
+  "seed_results": {
+    "42":  {"val_bpb": null, "artifact_bytes": null, "sliding_val_bpb": null},
+    "314": {"val_bpb": null, "artifact_bytes": null, "sliding_val_bpb": null},
+    "999": {"val_bpb": null, "artifact_bytes": null, "sliding_val_bpb": null}
+  },
+
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": "TODO_FILL (e.g., 2.9.1+cu128)",
+  "technique_summary": "PR #1493 SOTA recipe + Qwen G1 elementwise gated attention restricted to parallel-residual layers (7-10) + targeted MLP shrink 4.0x->3.25x on those same layers + Legal Score-First TTT",
+
+  "compliance": {
+    "train_under_600s": true,
+    "artifact_under_16mb": true,
+    "eval_under_600s": "TODO_VERIFY_FROM_LOG",
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true,
+    "score_first_ttt": true,
+    "three_seeds": true
+  },
+
+  "attribution": {
+    "sp8192_gptq_sdclip": "@clarkkev (PR #1394)",
+    "depth_recurrence": "@dexhunter (PR #1331, #1437)",
+    "parallel_residuals": "@Robby955 (PR #1412), @msisovic (PR #1204)",
+    "legal_ttt_framework": "@abaybektursun (PR #549), @dexhunter (PR #1413)",
+    "hyperparameter_tuning": "@X-Abhishek-X (PR #1445)",
+    "qwen_g1_gated_attention": "Qiu et al., Gated Attention for Large Language Models (NeurIPS 2025), arXiv:2505.06708",
+    "fatblock_gated_ew_validation": "this repo, doc/experiment_fatblock_results.md"
+  }
+}
