@@ -1,9 +1,12 @@
 # Experiment Results — gated_ew on parallel-residual layers (7-10) + targeted MLP 3.25×
 
-**Status:** seed-42 result complete. **Sub-SOTA at single seed.** Awaiting seed 314 and 999 confirmation.
-**Date:** 2026-04-27
-**Folder:** `records/track_10min_16mb/2026-04-27_GatedEW_Parallel_MLP325/`
-**Hardware:** 2× H100, 40 min training cap, TTT off, sliding window on.
+**Status:**
+- 2-GPU 2400s seed-42 result: sub-SOTA at single seed (1.08226 sliding, no TTT).
+- **8-GPU 600s seed-42 result (competition spec, with TTT): 1.08326 TTT — +0.0025 ABOVE SOTA. Architecture does NOT survive the competition wall-clock budget.** See "8-GPU competition-spec follow-up" section below.
+**Date:** 2026-04-27 (initial 2-GPU), 2026-04-29 (8-GPU follow-up)
+**Folders:** 
+- `records/track_10min_16mb/2026-04-27_GatedEW_Parallel_MLP325/` (2-GPU)
+- `records/track_10min_16mb/2026-04-28_ParallelGatedEW_LegalTTT_MLP325/` (8-GPU + TTT submission attempt)
 **Base:** PR #1493 SOTA (1.0810 BPB w/ TTT, 1.0827 sliding-only).
 **Predecessor:** `doc/experiment_gated_ew_all_layers_results.md` (all-layer variant overflowed 16 MB cap).
 
@@ -106,6 +109,68 @@ Step-4000 val_bpb came in at 1.1229 — worst of the 3 runs measured at that che
 - Launcher: `records/track_10min_16mb/2026-04-27_GatedEW_Parallel_MLP325/run.sh`
 - Run log (seed 42): `records/track_10min_16mb/2026-04-27_GatedEW_Parallel_MLP325/logs/gated_ew_parallel_s42.log`
 
+---
+
+## 8-GPU competition-spec follow-up (2026-04-29) — architecture does NOT win at the true budget
+
+### Setup
+
+Re-ran the same architecture (4 elementwise gates on parallel-residual layers 7-10, MLP 4.0× on 0-6 + 3.25× on 7-10) on the **official competition spec: 8× H100 / 600s training cap**, with **Legal Score-First TTT** enabled (same params as PR #1493 SOTA: lr=0.005, momentum=0.9, 3 epochs/chunk, 32K-token chunks). Folder: `records/track_10min_16mb/2026-04-28_ParallelGatedEW_LegalTTT_MLP325/`.
+
+### Seed 42 result
+
+| Stage | This run (8-GPU) | SOTA s42 (8-GPU) | Δ vs SOTA |
+|---|---:|---:|---:|
+| End step | 4592 | 4550 | +42 |
+| Pre-quant post-EMA val_bpb | **1.08990** | 1.08735 | **+0.00255** ❌ |
+| Quantized val_bpb | 1.10117 | 1.09970 | +0.00147 |
+| Quant tax | +0.01127 | +0.01235 | −0.00108 (gates compress *better* than SOTA's projections) |
+| Sliding val_bpb | 1.08453 | 1.08286 | +0.00167 |
+| **Quantized TTT val_bpb** | **1.08326** | **1.08079** | **+0.00247** ❌ |
+| Artifact bytes | 15,806,422 | 15,991,930 | −185,508 (193 KB headroom vs SOTA's 8 KB) |
+
+Decision after seed 42: **aborted seeds 314 and 999.** A 3-seed mean ≤ 1.08100 (SOTA) would have required the other two seeds to average ≤ 1.0790, i.e. −0.0036 below seed 42 — about 5σ from SOTA's seed-to-seed std (0.0002). Implausible; saves ~5 H100-hours of compute.
+
+### Why the 2-GPU result didn't survive — the lesson
+
+| | 2-GPU 2400s run | 8-GPU 600s run | Note |
+|---|---:|---:|---|
+| Total compute (GPU-seconds) | 4776 | 4704 | nominally equivalent |
+| Steps reached | 4824 | 4592 | **−232 steps on 8-GPU** |
+| Pre-quant post-EMA | 1.08757 | 1.08990 | +0.00233 |
+
+The 2-GPU "win" came from **232 extra optimizer steps**, not from the architecture. Two reasons 8-GPU underperforms its theoretical 4× speedup:
+
+1. **NCCL all-reduce overhead scales with rank count.** 8-rank reductions cost more wall-clock per step than 2-rank, so per-step time on 8 GPUs is ~3.87× faster than on 2 GPUs, not the ideal 4×.
+2. **Torch.compile fixed cost (~1-2 min)** eats a much bigger fraction of 600s than of 2400s.
+
+Net effect: ~232 fewer optimizer steps in the 600s budget. Late-training each step is worth ~0.0001 BPB, so 232 × 0.0001 ≈ **0.023 BPB raw-eval gap**, which propagates roughly proportionally through pre-quant (1.08757 → 1.08990 = 0.00233) and through to TTT (1.0823 → 1.08326).
+
+The architectural change (gates + targeted MLP shrink) costs **~0.0026 BPB pre-quant vs SOTA at the same step count**. With more steps available (2-GPU regime), the model trains long enough to absorb that cost. With the competition's 8-GPU/600s budget, it doesn't.
+
+### What it means
+
+- **Gates compress cleanly** — quant tax is *lower* than SOTA's (0.01127 vs 0.01235). The artifact-budget hypothesis (gates as MLP-rate, not attn-rate) was right, and the GPTQ pipeline handles them fine.
+- **Per-token MLP volume in the parallel zone matters more than I thought.** Reducing it from 4 × 2048 = 8192 to 4 × 1664 = 6656 (a 19% cut) was too aggressive for the 600s budget — the gates can't compensate fast enough.
+- **The general design principle still holds** (gates substitute for MLP capacity precisely where attn output enters the residual without a downstream MLP nonlinearity). But the substitution rate isn't 1:1 in this regime — the gates need more training to find their useful values than the wall-clock allows.
+
+### Course-correct candidates (not yet tested)
+
+Listed roughly in order of likelihood-to-help:
+
+1. **Headwise gates instead of elementwise** — gate is ~free (4 layers × 8 = 32 params per layer), keep MLP at 4.0× on all layers. Tests whether the per-layer-nonlinearity matters at all without paying any MLP capacity.
+2. **Less aggressive MLP shrink (3.5× or 3.625× on parallel)** — keeps more capacity, costs more headroom, may close the pre-quant gap enough for TTT to take us under SOTA.
+3. **Drop gates, just submit MLP shrink alone** — sanity baseline. If MLP 3.25× alone matches SOTA, the gates are doing nothing useful; if it's worse, the gates are adding ~something but not enough.
+4. **Revert to no architecture change.** PR #1493 SOTA is hard to beat; maybe the right play is finding a different lever entirely (different optimizer schedule, different recurrence pattern, etc.).
+
+### Files preserved
+
+- `train_seed42.log` — full 8-GPU/600s/TTT run log (seed 42 only; 314 and 999 not run)
+- `seed42_final_model.pt` — full-precision EMA state dict (~133 MB, recovery backup)
+- `seed42_final_model.int6.ptz` — 15.81 MB int6+brotli artifact
+- All inside `records/track_10min_16mb/2026-04-28_ParallelGatedEW_LegalTTT_MLP325/`
+
 ## Changelog
 
-- **2026-04-27**: Seed-42 result. **Sliding val_bpb 1.08226 (sub-SOTA by 0.00044), artifact 15.80 MB (195 KB headroom).** Pre-quant 1.08757, quant non-sliding 1.09889. Architecture: 4 elementwise gates on layers 7-10, MLP 4.0× on 0-6 + 3.25× on 7-10 (h=1664). Awaiting seeds 314 and 999.
+- **2026-04-27**: 2-GPU/2400s seed-42 result. **Sliding val_bpb 1.08226 (sub-SOTA by 0.00044), artifact 15.80 MB (195 KB headroom).** Pre-quant 1.08757, quant non-sliding 1.09889. Architecture: 4 elementwise gates on layers 7-10, MLP 4.0× on 0-6 + 3.25× on 7-10 (h=1664).
+- **2026-04-29**: **8-GPU/600s seed-42 result (competition spec, with TTT): 1.08326 TTT, +0.00247 ABOVE SOTA.** Aborted seeds 314 and 999. Architecture loses to SOTA at the true wall-clock budget; the 2-GPU win was budget-driven (232 extra optimizer steps), not architectural. Logged 4 candidate course-corrections to try next.
